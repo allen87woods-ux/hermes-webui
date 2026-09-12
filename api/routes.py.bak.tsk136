@@ -20518,15 +20518,6 @@ def _handle_session_sse_stream(handler, parsed):
     if not sid:
         return bad(handler, "session_id is required")
 
-    # TSK-136: hermes-android detection — the native background service sends
-    # a Dalvik/* UA (plain HttpURLConnection) and the in-app webview appends
-    # "Hermes-Android/<ver>" to its Chrome UA. Only phone subscribers may
-    # claim pending push events; browser tabs have no handler for them.
-    try:
-        _ua_ts136 = (getattr(handler, "headers", None) or {}).get("User-Agent", "") or ""
-    except Exception:
-        _ua_ts136 = ""
-
     # The (re)subscribing tab reports its last-known message_count via
     # ?known_count=N so the on-subscribe self-heal can detect a server-initiated
     # turn that started AND finished entirely inside this tab's SSE gap (see the
@@ -20544,10 +20535,7 @@ def _handle_session_sse_stream(handler, parsed):
         persisted_message_count_for_session,
         should_emit_session_updated,
         pending_push_take_for,
-        is_phone_ua,
     )
-
-    _is_phone_ts136 = is_phone_ua(_ua_ts136)
 
     # Atomic get-or-create + subscribe under SESSION_CHANNELS_LOCK. Doing these
     # two steps separately (get_or_create_session_channel then ch.subscribe)
@@ -20557,7 +20545,7 @@ def _handle_session_sse_stream(handler, parsed):
     # orphaning this subscriber on a channel no longer in SESSION_CHANNELS.
     # bg_task_complete emits would then never reach this queue. See
     # subscribe_to_session_channel for the full rationale (PR #2971 Greptile P1).
-    ch, q = subscribe_to_session_channel(sid, maxsize=64, phone=_is_phone_ts136)
+    ch, q = subscribe_to_session_channel(sid, maxsize=64)
 
     # NOTE: ``subscribe_to_session_channel`` above acquires a subscriber slot
     # that MUST be released on every exit path. Header setup
@@ -20670,9 +20658,7 @@ def _handle_session_sse_stream(handler, parsed):
             # notification lands on the next reconnect. Events are claimed
             # per-session in the store, so no later subscriber gets a second
             # copy. `recovered: true` marks the frame as a replay.
-            for _replay_event, _replay_data in pending_push_take_for(
-                sid, phone=_is_phone_ts136
-            ):
+            for _replay_event, _replay_data in pending_push_take_for(sid):
                 _sse(handler, _replay_event, _replay_data)
         except _CLIENT_DISCONNECT_ERRORS:
             # Client vanished mid-recovery — re-raise so the outer handler

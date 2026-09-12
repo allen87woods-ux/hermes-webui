@@ -425,13 +425,11 @@ def broadcast_to_all_session_channels(event: str, data: dict) -> int:
     stream (re)subscribes — a stream gap at completion time no longer loses
     the phone notification permanently.
 
-    TSK-136: the replay is claimed ONLY by phone subscribers (webviews have no
-    handler for these events — a webview claim drained the store into the
-    void). When a push event fires while NO phone stream is live it is parked
-    in the file-backed pending store (TTL 30 min) and replayed to the first
-    phone stream that (re)subscribes, so the completion is never invisible.
-    (The earlier Telegram safety-net nudge was removed 2026-08-28 per Allen —
-    webui notifications must stay inside the webui app, never Telegram.)
+    TSK-136: the replay is claimed ONLY by phone subscribers (webviews have
+    no handler for these events — a webview claim drained the store into the
+    void), and whenever a push event fires while NO phone stream is live an
+    immediate Telegram safety-net nudge is sent so the completion is never
+    invisible.
     """
     delivered_total = 0
     with SESSION_CHANNELS_LOCK:

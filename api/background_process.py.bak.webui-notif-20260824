@@ -138,14 +138,12 @@ class SessionChannel:
         self.last_event_at = now
         self.last_subscriber_drop_at: float | None = None
 
-    def subscribe(self, maxsize: int = 16, phone: bool = False) -> queue.Queue:
+    def subscribe(self, maxsize: int = 16) -> queue.Queue:
         q: queue.Queue = queue.Queue(maxsize=maxsize)
         with self._lock:
             self._subscribers.append(q)
             # Cancel any pending subscribers-empty grace timer.
             self.last_subscriber_drop_at = None
-        if phone:
-            _phone_stream_register(self.session_id, q)
         return q
 
     def unsubscribe(self, q: queue.Queue) -> None:
@@ -156,7 +154,6 @@ class SessionChannel:
                 pass
             if not self._subscribers:
                 self.last_subscriber_drop_at = time.time()
-        _phone_stream_unregister(q)
 
     def subscriber_count(self) -> int:
         with self._lock:
@@ -233,222 +230,8 @@ def get_session_channel(session_id: str) -> Optional[SessionChannel]:
         return SESSION_CHANNELS.get(session_id)
 
 
-# ── TSK-135: pending-broadcast replay (offline buffer) ──────────────────────
-# broadcast_to_all_session_channels() was fire-and-forget: a turn_completed /
-# approval_required that fired while the hermes-android background service's
-# session stream was disconnected (stream churn — 4-9s gaps observed in the
-# access logs — app suspension, webui restart) was lost PERMANENTLY and the
-# phone never notified. The reconnect loop makes that a coin flip.
-#
-# Fix: when a broadcast reaches ZERO live subscribers, park it in a small
-# file-backed pending store (STATE_DIR/pending_push_events.json, TTL 30min,
-# max 16 entries). The next (re)subscriber of ANY session stream gets the
-# still-pending events replayed (with `recovered: true`). Storing only when
-# delivered==0 means a subscriber that already got the event live never
-# receives a second copy (no double notification).
-
-import json as _json_ts135
-import os as _os_ts135
-
-_PENDING_PUSH_TTL_SECS = float(
-    _os_ts135.getenv("HERMES_WEBUI_PENDING_PUSH_TTL", "1800")
-)
-_PENDING_PUSH_MAX = 16
-_PENDING_PUSH_FILE = None
-_PENDING_PUSH_LOCK = threading.Lock()
-
-
-def _pending_push_file():
-    global _PENDING_PUSH_FILE
-    if _PENDING_PUSH_FILE is None:
-        from api import config as _cfg
-        _cfg.STATE_DIR.mkdir(parents=True, exist_ok=True)
-        _PENDING_PUSH_FILE = _cfg.STATE_DIR / "pending_push_events.json"
-    return _PENDING_PUSH_FILE
-
-
-def _pending_push_load() -> list:
-    try:
-        raw = _pending_push_file().read_text(encoding="utf-8")
-        data = _json_ts135.loads(raw)
-        if isinstance(data, list):
-            return [e for e in data if isinstance(e, dict)]
-    except FileNotFoundError:
-        pass
-    except Exception:
-        logger.debug("pending-push store read failed", exc_info=True)
-    return []
-
-
-def _pending_push_write(entries: list) -> None:
-    try:
-        path = str(_pending_push_file())
-        with open(path + ".tmp", "w", encoding="utf-8") as fh:
-            fh.write(_json_ts135.dumps(entries, ensure_ascii=False))
-        _os_ts135.replace(path + ".tmp", path)
-    except Exception:
-        logger.debug("pending-push store write failed", exc_info=True)
-
-
-# ── TSK-136: phone (hermes-android) stream tracking ────────────────────────
-# TSK-135's replay was claimed by the FIRST (re)subscriber of any session —
-# in practice the webui browser tabs, which have NO handler for
-# turn_completed / approval_required (verified: static/messages.js never
-# listens for either). The store drained into the void and the phone never
-# notified (observed 08-28: two completions claimed by six webview sessions,
-# zero phone delivery). Only the hermes-android app can surface these events
-# as a notification, so TSK-136:
-#   1. Phone clients are detected by User-Agent — the native background
-#      service uses a plain HttpURLConnection (Dalvik/* UA); the in-app
-#      webview sends a Chrome UA with the "Hermes-Android/<ver>" suffix.
-#   2. Pending push events are claimed ONLY by phone subscribers.
-#   3. Notification delivery is app-native: the in-app webview surfaces
-#      turn_completed via sendBrowserNotification (real Android notification
-#      via the HermesAndroidNotifications polyfill). No Telegram fallback —
-#      webui notifications never go to Telegram (Allen's explicit rule).
-_PHONE_UA_MARKERS = ("android", "dalvik")
-
-
-def is_phone_ua(ua: str) -> bool:
-    """True when the User-Agent looks like a hermes-android client."""
-    if not ua:
-        return False
-    low = ua.lower()
-    return any(m in low for m in _PHONE_UA_MARKERS)
-
-
-import weakref as _weakref_ts136
-
-_PHONE_STREAMS_LOCK = threading.Lock()
-_PHONE_STREAMS: dict = {}  # id(queue) -> (session_id, weakref)
-
-
-def _phone_stream_register(session_id: str, q: "queue.Queue") -> None:
-    with _PHONE_STREAMS_LOCK:
-        _PHONE_STREAMS[id(q)] = (session_id, _weakref_ts136.ref(q))
-
-
-def _phone_stream_unregister(q: "queue.Queue") -> None:
-    with _PHONE_STREAMS_LOCK:
-        entry = _PHONE_STREAMS.get(id(q))
-        if entry is not None and entry[1]() is q:
-            del _PHONE_STREAMS[id(q)]
-
-
-def phone_streams_live() -> int:
-    """Count live phone subscribers, pruning dead weakrefs."""
-    with _PHONE_STREAMS_LOCK:
-        dead = [qid for qid, (_sid, ref) in _PHONE_STREAMS.items() if ref() is None]
-        for qid in dead:
-            del _PHONE_STREAMS[qid]
-        return len(_PHONE_STREAMS)
-
-
-def _pending_push_store(event: str, data: dict, phone_live: bool) -> None:
-    """Park a broadcast that reached zero live subscribers (TSK-135/136)."""
-    if event not in ("turn_completed", "approval_required"):
-        return
-    now = time.time()
-    with _PENDING_PUSH_LOCK:
-        entries = [
-            e for e in _pending_push_load()
-            if now - float(e.get("ts", 0)) < _PENDING_PUSH_TTL_SECS
-        ]
-        entries.append({
-            "ts": now,
-            "event": event,
-            "data": data,
-            "replayed_to": [],
-            "phone_live": bool(phone_live),
-            "phone_claimed": False,
-        })
-        entries = entries[-_PENDING_PUSH_MAX:]
-        _pending_push_write(entries)
-    logger.warning(
-        "TSK-135: %s broadcast reached 0 subscribers; parked for replay "
-        "(session_id=%s, phone_live=%s)", event,
-        (data or {}).get("session_id", "?"), bool(phone_live),
-    )
-
-
-def pending_push_take_for(session_id: str, phone: bool = False) -> list:
-    """Atomically claim still-pending push events for a (re)subscriber.
-
-    TSK-136: ONLY phone subscribers (hermes-android) may claim — browser /
-    webview tabs have no turn_completed / approval_required handler, so a
-    webview claim would drain the store into the void (observed 08-28: two
-    completions claimed by six webview sessions, zero phone delivery).
-
-    Returns a list of ``(event, data)`` tuples; each ``data`` gets
-    ``recovered: true`` so clients can tell a replay from a live frame.
-    The phone claim is idempotent per event (``phone_claimed`` flag) so the
-    native stream's reconnect churn never re-notifies the same event.
-    """
-    if not phone:
-        return []
-    now = time.time()
-    with _PENDING_PUSH_LOCK:
-        entries = [
-            e for e in _pending_push_load()
-            if now - float(e.get("ts", 0)) < _PENDING_PUSH_TTL_SECS
-        ]
-        taken = []
-        for e in entries:
-            if e.get("phone_claimed"):
-                continue
-            replayed_to = e.get("replayed_to") or []
-            if session_id not in replayed_to:
-                replayed_to.append(session_id)
-            e["replayed_to"] = replayed_to
-            e["phone_claimed"] = True
-            taken.append((e["event"], dict(e.get("data") or {})))
-        entries = entries[-_PENDING_PUSH_MAX:]
-        _pending_push_write(entries)
-    for _ev, data in taken:
-        data["recovered"] = True
-    return taken
-
-
-def broadcast_to_all_session_channels(event: str, data: dict) -> int:
-    """TSK-134: push (event, data) to EVERY live SessionChannel (all sessions).
-
-    The hermes-android background service streams only ONE session (the one
-    loaded in the app), but agent turns can complete in ANY session — this
-    WebUI runs its own in-process agents per session. Broadcasting lets the
-    phone fire a completion/approval notification regardless of which
-    session produced the event. Unknown event names are ignored by the
-    in-app UI (it only listens to its own event set), so this is safe for
-    concurrent browser tabs.
-
-    TSK-135: when the broadcast reaches zero live subscribers, it is parked
-    in the file-backed pending store and replayed when the phone's session
-    stream (re)subscribes — a stream gap at completion time no longer loses
-    the phone notification permanently.
-
-    TSK-136: the replay is claimed ONLY by phone subscribers (webviews have no
-    handler for these events — a webview claim drained the store into the
-    void). When a push event fires while NO phone stream is live it is parked
-    in the file-backed pending store (TTL 30 min) and replayed to the first
-    phone stream that (re)subscribes, so the completion is never invisible.
-    (The earlier Telegram safety-net nudge was removed 2026-08-28 per Allen —
-    webui notifications must stay inside the webui app, never Telegram.)
-    """
-    delivered_total = 0
-    with SESSION_CHANNELS_LOCK:
-        items = list(SESSION_CHANNELS.items())
-    for sid, ch in items:
-        try:
-            delivered_total += ch.emit(event, data)
-        except Exception:
-            logger.debug("broadcast emit failed for session %s", sid, exc_info=True)
-    phone_reached = phone_streams_live() > 0
-    if not phone_reached:
-        _pending_push_store(event, data, phone_live=False)
-    return delivered_total
-
-
 def subscribe_to_session_channel(
-    session_id: str, maxsize: int = 16, phone: bool = False
+    session_id: str, maxsize: int = 16
 ) -> tuple["SessionChannel", "queue.Queue"]:
     """Atomically get-or-create the channel for ``session_id`` AND register a
     subscriber on it, both under ``SESSION_CHANNELS_LOCK``.
@@ -484,7 +267,7 @@ def subscribe_to_session_channel(
         if ch is None:
             ch = SessionChannel(session_id)
             SESSION_CHANNELS[session_id] = ch
-        q = ch.subscribe(maxsize=maxsize, phone=phone)
+        q = ch.subscribe(maxsize=maxsize)
         return ch, q
 
 

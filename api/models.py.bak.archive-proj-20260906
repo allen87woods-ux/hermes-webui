@@ -7714,16 +7714,7 @@ def _load_cli_sessions_uncached(
         _sidecar_meta = _state_projection_sidecar_metadata(sid)
         if _sidecar_meta.get('title'):
             _title = _sidecar_meta['title']
-        # Local patch 2026-09-06: honor state.db's own archived/hidden flag.
-        # Upstream only reads archived from a WebUI sidecar JSON, so
-        # `hermes sessions archive` (state.db column) was ignored by the
-        # state.db sidebar projection and archived Agent/subagent rows kept
-        # showing in the sidebar.
-        _db_hidden = (
-            bool(row.get('archived'))
-            or bool((row.get('hidden') or 0) == 1)
-        )
-        _archived = bool(_sidecar_meta.get('archived')) or _db_hidden
+        _archived = bool(_sidecar_meta.get('archived'))
         _display_title = _title or f'{_source.title()} Session'
         cli_sessions.append({
             'session_id': sid,

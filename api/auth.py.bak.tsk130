@@ -1089,8 +1089,6 @@ def check_auth(handler, parsed) -> bool:
         or parsed.path.startswith('/session/static/')
     ):
         return True
-    # TSK-130 probe exemption REMOVED 08-23: app v1.0.24 (upstream f16af16) now
-    # authenticates its probes; no client needed the bypass. All endpoints gated.
     cookie_val = parse_cookie(handler)
     has_session = bool(cookie_val and verify_session(cookie_val))
     if parsed.path == '/api/auth/logout':

@@ -767,35 +767,6 @@ def submit_gateway_pending_mirror(session_key: str, approval: dict) -> tuple[dic
         head, total, _changed = reconcile_gateway_pending_mirror_locked(session_key)
         _approval_sse_notify_locked(session_key, head, total)
     publish_session_list_changed("attention_pending")
-    # TSK-134: fan the approval out to EVERY live session channel as
-    # 'approval_required' with the flat payload the hermes-android background
-    # service expects (approval_id / session_id / description / choices /
-    # pending_count). The service streams only the session loaded in the app,
-    # so without this broadcast an approval in another session never pings the
-    # phone. Event name is 'approval_required' (NOT 'approval') so the in-app
-    # UI — which renders 'approval' events as cards — ignores the broadcast.
-    try:
-        from api.background_process import (
-            broadcast_to_all_session_channels as _bc_approval,
-        )
-        _bc_data = {
-            "approval_id": str((head or {}).get("approval_id") or ""),
-            "session_id": session_key,
-            "description": (
-                (head or {}).get("description")
-                or (head or {}).get("command")
-                or "Hermes needs your approval to continue."
-            ),
-            "choices": (head or {}).get("choices")
-                       or (head or {}).get("choices_offered")
-                       or [],
-            "pending_count": total,
-        }
-        _bc_approval("approval_required", _bc_data)
-    except Exception:
-        logging.getLogger(__name__).debug(
-            "approval_required broadcast failed for %s", session_key, exc_info=True
-        )
     return (dict(head) if head else None), total
 
 

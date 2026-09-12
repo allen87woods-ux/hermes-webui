@@ -2355,12 +2355,6 @@ def _merge_process_wakeup_pause_into_current_session(
     return recorded
 
 
-# Local patch 2026-08-28 (cancel-notify): stream_ids that already emitted a
-# cancel turn_completed broadcast (5-min TTL via threading.Timer). Prevents
-# duplicate phone notifications if a finalize path re-enters for one stream.
-_CANCEL_NOTIFY_EMITTED: set = set()
-
-
 def _finalize_cancelled_turn(
     session,
     *,
@@ -2436,39 +2430,6 @@ def _finalize_cancelled_turn(
         session.save()
     except Exception:
         logger.debug("Failed to persist cancelled turn", exc_info=True)
-    # Local patch 2026-08-28 (cancel-notify): broadcast a turn_completed frame
-    # for CANCELLED persistent turns too. Before this, only the normal-completion
-    # path (streaming.py ~11977) and route_approvals broadcast turn_completed; a
-    # user-cancel ended with a bare 'cancel' event, so the phone never got a
-    # notification when Allen hit Stop (08-28 DeepSeek loop: an 18-min run was
-    # cancelled and the phone saw nothing). The frontend handler (messages.js,
-    # TSK-136) and the android background service (ReconnectSessionStreamSupport)
-    # both render the summary as the notification body, so status='cancelled'
-    # surfaces as "Task cancelled." / the message passed here.
-    # Generation-safe: we only reach this point when the writeback-owner guard
-    # above confirms this stream still owns the session, so the frame refers to
-    # a real cancellation. Dedup via a per-stream stamp prevents double-fire if
-    # a finalize path re-enters for the same stream.
-    try:
-        if stream_id and stream_id not in _CANCEL_NOTIFY_EMITTED:
-            _sid = getattr(session, "session_id", None)
-            if _sid:
-                _CANCEL_NOTIFY_EMITTED.add(stream_id)
-                if len(_CANCEL_NOTIFY_EMITTED) > 1024:
-                    _CANCEL_NOTIFY_EMITTED.clear()
-                from api.background_process import broadcast_to_all_session_channels
-                broadcast_to_all_session_channels(
-                    "turn_completed",
-                    {"status": "cancelled", "summary": message,
-                     "session_id": _sid},
-                )
-    except Exception:
-        logger.debug("cancel turn_completed broadcast failed for stream %s",
-                     stream_id, exc_info=True)
-    threading.Timer(
-        300.0,
-        lambda: _CANCEL_NOTIFY_EMITTED.discard(stream_id) if stream_id else None,
-    ).start()
 
 
 def _aiagent_import_error_detail() -> str:

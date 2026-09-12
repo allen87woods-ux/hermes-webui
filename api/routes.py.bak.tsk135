@@ -20518,15 +20518,6 @@ def _handle_session_sse_stream(handler, parsed):
     if not sid:
         return bad(handler, "session_id is required")
 
-    # TSK-136: hermes-android detection — the native background service sends
-    # a Dalvik/* UA (plain HttpURLConnection) and the in-app webview appends
-    # "Hermes-Android/<ver>" to its Chrome UA. Only phone subscribers may
-    # claim pending push events; browser tabs have no handler for them.
-    try:
-        _ua_ts136 = (getattr(handler, "headers", None) or {}).get("User-Agent", "") or ""
-    except Exception:
-        _ua_ts136 = ""
-
     # The (re)subscribing tab reports its last-known message_count via
     # ?known_count=N so the on-subscribe self-heal can detect a server-initiated
     # turn that started AND finished entirely inside this tab's SSE gap (see the
@@ -20543,11 +20534,7 @@ def _handle_session_sse_stream(handler, parsed):
         active_stream_id_for_session,
         persisted_message_count_for_session,
         should_emit_session_updated,
-        pending_push_take_for,
-        is_phone_ua,
     )
-
-    _is_phone_ts136 = is_phone_ua(_ua_ts136)
 
     # Atomic get-or-create + subscribe under SESSION_CHANNELS_LOCK. Doing these
     # two steps separately (get_or_create_session_channel then ch.subscribe)
@@ -20557,7 +20544,7 @@ def _handle_session_sse_stream(handler, parsed):
     # orphaning this subscriber on a channel no longer in SESSION_CHANNELS.
     # bg_task_complete emits would then never reach this queue. See
     # subscribe_to_session_channel for the full rationale (PR #2971 Greptile P1).
-    ch, q = subscribe_to_session_channel(sid, maxsize=64, phone=_is_phone_ts136)
+    ch, q = subscribe_to_session_channel(sid, maxsize=64)
 
     # NOTE: ``subscribe_to_session_channel`` above acquires a subscriber slot
     # that MUST be released on every exit path. Header setup
@@ -20660,20 +20647,6 @@ def _handle_session_sse_stream(handler, parsed):
                             "known_count": subscriber_known_count,
                             "source": "subscribe_recovery",
                         })
-            # ── TSK-135: replay pending broadcast events (offline buffer) ──
-            # turn_completed / approval_required broadcasts that reached ZERO
-            # live subscribers at emit time (stream gap, webui restart, app
-            # suspension) used to be lost forever — the phone's native
-            # background service never fired the missed notification. The
-            # file-backed pending store (background_process.pending_push_*)
-            # holds them; replay to this (re)connecting client here so the
-            # notification lands on the next reconnect. Events are claimed
-            # per-session in the store, so no later subscriber gets a second
-            # copy. `recovered: true` marks the frame as a replay.
-            for _replay_event, _replay_data in pending_push_take_for(
-                sid, phone=_is_phone_ts136
-            ):
-                _sse(handler, _replay_event, _replay_data)
         except _CLIENT_DISCONNECT_ERRORS:
             # Client vanished mid-recovery — re-raise so the outer handler
             # treats it as a normal disconnect and the finally still cleans up.
@@ -20690,16 +20663,6 @@ def _handle_session_sse_stream(handler, parsed):
             except queue.Empty:
                 handler.wfile.write(b': keepalive\n\n')
                 handler.wfile.flush()
-                # TSK-135: also emit a real `ping` event every heartbeat. The
-                # comment keepalive above carries BYTES but no SSE event; if a
-                # client's EventSource reader idles on *events* rather than
-                # bytes, the 5s comment-only gap looks like a dead stream
-                # (~5-6s churn loop observed in the hermes-android background
-                # service with known_count frozen). A real event frame keeps
-                # that path alive. `ping` is unknown to the in-app UI and to
-                # the browser frontend (no listeners) - ignored by design,
-                # same convention as TSK-134's broadcast event names.
-                _sse(handler, 'ping', {"session_id": sid})
                 continue
             if payload is None:
                 break

@@ -3938,21 +3938,6 @@ function _projectsTasksEditFormHTML(tid, name, status, priority, risk) {
   '</div>';
 }
 
-function _projectsDecisionMapsHTML(maps) {
-  const rows = maps.map(function (m) {
-    const mapLine = m.map ? '<div style="font-size:10px;color:var(--muted);font-family:monospace;margin-top:2px">' + esc(m.map) + '</div>' : '';
-    return '<div style="padding:6px 8px;border:1px solid var(--border);border-radius:6px;margin-bottom:6px">' +
-      '<div style="font-weight:600;font-size:12px;color:var(--text)">' + esc(m.name) + '</div>' +
-      '<div style="font-size:11px;color:var(--muted);margin-top:2px;line-height:1.4">' + esc(m.detail) + '</div>' +
-      mapLine +
-      '</div>';
-  }).join('');
-  return '<div style="padding:2px 0 8px;border-bottom:1px solid var(--border);margin-bottom:10px">' +
-    '<span style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)">Decision Maps · wayfinder</span>' +
-    rows +
-    '</div>';
-}
-
 async function _renderProjectsTasksPanel() {
   _projectsTasksStartPoll();
   const section = document.getElementById('projectsTasksSection');
@@ -3972,10 +3957,7 @@ async function _renderProjectsTasksPanel() {
     const active = tasks.filter(function (t) { return t.status !== 'completed'; });
     const done = tasks.filter(function (t) { return t.status === 'completed'; });
     const rowHTML = function (list) { return list.map(_projectsTasksRowHTML).join(''); };
-    const dmaps = Array.isArray(data.decision_maps) ? data.decision_maps : [];
-    const dmHTML = dmaps.length ? _projectsDecisionMapsHTML(dmaps) : '';
     section.innerHTML =
-      dmHTML +
       '<div style="padding:2px 0 8px;border-bottom:1px solid var(--border);margin-bottom:10px">' +
         '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px">' +
           '<span style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)">Projects · projects.md</span>' +

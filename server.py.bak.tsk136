@@ -366,14 +366,6 @@ class Handler(BaseHTTPRequestHandler):
             'status': int(code) if str(code).isdigit() else code,
             'ms': duration_ms,
         }
-        # TSK-136: UA in the access log — distinguishes the native Android
-        # service (Dalvik/*) from webview/browser streams (Chrome UA).
-        try:
-            _ua_log = (self.headers.get('User-Agent') or '')[:160]
-            if _ua_log:
-                record_data['ua'] = _ua_log
-        except Exception:
-            pass
         if forwarded_for:
             record_data['forwarded_for'] = forwarded_for
         record = _json.dumps(record_data)

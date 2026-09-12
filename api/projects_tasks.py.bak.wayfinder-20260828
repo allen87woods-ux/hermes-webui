@@ -1,0 +1,298 @@
+"""Hermes projects.md (TSK tracker) bridge for the WebUI.
+
+Endpoints
+---------
+GET   /api/tasks/projects  → parse projects.md → {tasks: [...], counter, mtime, path}
+POST  /api/tasks/projects  → create task {name, status?, priority?, risk_level?}
+                             allocates next TSK-XXX id, bumps the Notes counter
+PATCH /api/tasks/projects  → update task {id, fields: {name?, status?, priority?,
+                             risk_level?, definition_of_done?, context?}}
+
+Source of truth stays ``$HERMES_HOME/projects.md`` (default ``~/.hermes/projects.md``;
+override with ``HERMES_PROJECTS_FILE`` for tests). All writes are atomic
+(temp file + os.replace) and read-modify-write, so unrelated lines are preserved.
+Task blocks use the schema from projects.md::
+
+    ### TSK-XXX: Task Name
+    - **status:** pending | in_progress | paused | completed | blocked
+    - **definition_of_done:** ...
+    - **risk_level:** safe | moderate | risky
+    - **priority:** high | medium | low
+    - **context:** ...
+    - **created:** YYYY-MM-DD
+    - **updated:** YYYY-MM-DD
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import os
+import re
+import tempfile
+from pathlib import Path
+
+from api.helpers import bad, j
+
+# ── constants ────────────────────────────────────────────────────────
+
+VALID_STATUS = {"pending", "in_progress", "paused", "completed", "blocked"}
+VALID_PRIORITY = {"high", "medium", "low"}
+VALID_RISK = {"safe", "moderate", "risky"}
+
+TASK_HEAD_RE = re.compile(r"^###\s+(TSK-\d+)\s*:\s*(.+?)\s*$")
+FIELD_RE = re.compile(r"^-\s+\*\*([a-z_]+):\*\*\s*(.*)$")
+COUNTER_RE = re.compile(r"Next task should be TSK-(\d+)\+", re.IGNORECASE)
+SECTION_RE = re.compile(r"^##\s+")
+
+_DEFAULTS = {
+    "status": "pending",
+    "priority": "medium",
+    "risk_level": "safe",
+    "definition_of_done": "",
+    "context": "",
+    "created": "",
+    "updated": "",
+}
+
+
+# ── file access ──────────────────────────────────────────────────────
+
+
+def projects_path() -> Path:
+    override = os.environ.get("HERMES_PROJECTS_FILE")
+    if override:
+        return Path(override)
+    home = os.environ.get("HERMES_HOME") or str(Path.home())
+    return Path(home) / "projects.md"
+
+
+def _read(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as e:
+        raise FileNotFoundError(str(e))
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".projects-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, str(path))
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# ── parsing ──────────────────────────────────────────────────────────
+
+
+def parse_tasks(text: str) -> list[dict]:
+    tasks: list[dict] = []
+    cur: dict | None = None
+    for line in text.splitlines():
+        m = TASK_HEAD_RE.match(line)
+        if m:
+            cur = dict(_DEFAULTS)
+            cur["id"] = m.group(1)
+            cur["name"] = m.group(2).strip()
+            tasks.append(cur)
+            continue
+        if cur is not None:
+            fm = FIELD_RE.match(line)
+            if fm:
+                key = fm.group(1)
+                if key in cur:
+                    cur[key] = fm.group(2).strip()
+    return tasks
+
+
+def parse_counter(text: str) -> int:
+    m = COUNTER_RE.search(text)
+    return int(m.group(1)) if m else 0
+
+
+def _active_projects_insert_at(lines: list[str]) -> int | None:
+    """Index where a new task block should be inserted: end of
+    ``## Active Projects`` (before the next ``##`` section), else EOF."""
+    for i, ln in enumerate(lines):
+        if SECTION_RE.match(ln) and "active projects" in ln.lower():
+            for k in range(i + 1, len(lines)):
+                if SECTION_RE.match(lines[k]):
+                    return k
+            return len(lines)
+    return None
+
+
+def _task_block_bounds(lines: list[str], tid: str) -> tuple[int, int] | None:
+    start = None
+    for i, ln in enumerate(lines):
+        if ln.startswith(f"### {tid}:") and TASK_HEAD_RE.match(ln):
+            start = i
+            break
+    if start is None:
+        return None
+    for i in range(start + 1, len(lines)):
+        if TASK_HEAD_RE.match(lines[i]) or SECTION_RE.match(lines[i]):
+            return start, i
+    return start, len(lines)
+
+
+def _set_block_field(block: list[str], key: str, value: str) -> None:
+    pattern = re.compile(r"^-\s+\*\*" + key + r":\*\*.*$")
+    for i, ln in enumerate(block):
+        if pattern.match(ln):
+            block[i] = f"- **{key}:** {value}"
+            return
+    ins = len(block)
+    for i, ln in enumerate(block):
+        if ln.startswith("- **created:**"):
+            ins = i
+            break
+    block.insert(ins, f"- **{key}:** {value}")
+
+
+# ── handlers ─────────────────────────────────────────────────────────
+
+
+def handle_projects_tasks_get(handler, parsed) -> bool:
+    path = projects_path()
+    try:
+        text = _read(path)
+    except FileNotFoundError:
+        return j(handler, {"tasks": [], "counter": 0, "mtime": None,
+                           "path": str(path), "error": "projects.md not found"})
+    try:
+        mtime = int(path.stat().st_mtime)
+    except OSError:
+        mtime = None
+    tasks = parse_tasks(text)
+    return j(handler, {"tasks": tasks, "counter": parse_counter(text),
+                       "mtime": mtime, "path": str(path)})
+
+
+def handle_projects_tasks_post(handler, parsed, body) -> bool:
+    path = projects_path()
+    try:
+        text = _read(path)
+    except FileNotFoundError:
+        return bad(handler, "projects.md not found", status=404)
+
+    body = body or {}
+    name = str(body.get("name") or "").strip()
+    if not name:
+        return bad(handler, "name is required", status=400)
+    status = str(body.get("status") or "pending").strip()
+    priority = str(body.get("priority") or "medium").strip()
+    risk = str(body.get("risk_level") or "safe").strip()
+    if status not in VALID_STATUS:
+        return bad(handler, f"invalid status (valid: {', '.join(sorted(VALID_STATUS))})", status=400)
+    if priority not in VALID_PRIORITY:
+        return bad(handler, f"invalid priority (valid: {', '.join(sorted(VALID_PRIORITY))})", status=400)
+    if risk not in VALID_RISK:
+        return bad(handler, f"invalid risk_level (valid: {', '.join(sorted(VALID_RISK))})", status=400)
+
+    counter = parse_counter(text)
+    existing_ids = {t["id"] for t in parse_tasks(text)}
+    n = counter if counter else 1
+    while f"TSK-{n}" in existing_ids:
+        n += 1
+
+    today = dt.date.today().isoformat()
+    block = (
+        f"### TSK-{n}: {name}\n"
+        f"- **status:** {status}\n"
+        f"- **approved:** {today} (explicit ask via WebUI Tasks panel)\n"
+        f"- **definition_of_done:** \n"
+        f"- **risk_level:** {risk}\n"
+        f"- **priority:** {priority}\n"
+        f"- **context:** \n"
+        f"- **created:** {today}\n"
+        f"- **updated:** {today}\n"
+    )
+
+    lines = text.splitlines()
+    insert_at = _active_projects_insert_at(lines)
+    if insert_at is None:
+        insert_at = len(lines)
+    while insert_at > 0 and lines[insert_at - 1].strip() == "":
+        insert_at -= 1
+    new_lines = lines[:insert_at] + [""] + block.rstrip("\n").splitlines() + lines[insert_at:]
+
+    text = "\n".join(new_lines).rstrip("\n") + "\n"
+    if counter:
+        text = COUNTER_RE.sub(f"Next task should be TSK-{n + 1}+", text, count=1)
+        text = re.sub(
+            r"(\(Updated [^,]+, )",
+            lambda m: m.group(1) + f"TSK-{n} = {name}; ",
+            text,
+            count=1,
+        )
+    _atomic_write(path, text)
+
+    tasks = parse_tasks(text)
+    task = next((t for t in tasks if t["id"] == f"TSK-{n}"), None)
+    return j(handler, {"ok": True, "task": task, "counter": parse_counter(text)})
+
+
+def handle_projects_tasks_patch(handler, parsed, body) -> bool:
+    path = projects_path()
+    try:
+        text = _read(path)
+    except FileNotFoundError:
+        return bad(handler, "projects.md not found", status=404)
+
+    body = body or {}
+    tid = str(body.get("id") or "").strip()
+    if not tid:
+        return bad(handler, "id is required", status=400)
+    fields = body.get("fields") or {}
+    if not isinstance(fields, dict):
+        return bad(handler, "fields must be an object", status=400)
+
+    allowed = {"name", "status", "priority", "risk_level", "definition_of_done", "context"}
+    unknown = set(fields) - allowed
+    if unknown:
+        return bad(handler, f"unknown fields: {', '.join(sorted(unknown))}", status=400)
+    if "status" in fields and fields["status"] not in VALID_STATUS:
+        return bad(handler, "invalid status", status=400)
+    if "priority" in fields and fields["priority"] not in VALID_PRIORITY:
+        return bad(handler, "invalid priority", status=400)
+    if "risk_level" in fields and fields["risk_level"] not in VALID_RISK:
+        return bad(handler, "invalid risk_level", status=400)
+
+    lines = text.splitlines()
+    bounds = _task_block_bounds(lines, tid)
+    if bounds is None:
+        return bad(handler, "task not found", status=404)
+    start, end = bounds
+    block = lines[start:end]
+
+    if "name" in fields:
+        new_name = str(fields["name"]).strip()
+        if not new_name:
+            return bad(handler, "name cannot be empty", status=400)
+        block[0] = re.sub(
+            r"^(###\s+TSK-\d+\s*:\s*).*$",
+            lambda m: m.group(1) + new_name,
+            block[0],
+        )
+
+    today = dt.date.today().isoformat()
+    for key, value in fields.items():
+        if key == "name":
+            continue
+        _set_block_field(block, key, str(value).strip())
+    _set_block_field(block, "updated", today)
+
+    new_lines = lines[:start] + block + lines[end:]
+    text = "\n".join(new_lines).rstrip("\n") + "\n"
+    _atomic_write(path, text)
+
+    tasks = parse_tasks(text)
+    task = next((t for t in tasks if t["id"] == tid), None)
+    return j(handler, {"ok": True, "task": task})
