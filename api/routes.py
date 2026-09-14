@@ -5306,6 +5306,7 @@ def _get_or_materialize_session(sid: str, *, refresh_cli_messages: bool = False)
             title=cli_meta.get("title") or title_from(get_cli_session_messages(sid), "CLI Session"),
             workspace=get_last_workspace(),
             model=cli_meta.get("model") or "unknown",
+            model_provider=cli_meta.get("model_provider"),
             created_at=cli_meta.get("created_at"),
             updated_at=cli_meta.get("updated_at"),
         )
@@ -5324,6 +5325,7 @@ def _get_or_materialize_session(sid: str, *, refresh_cli_messages: bool = False)
             profile=cli_meta.get("profile"),
             created_at=cli_meta.get("created_at"),
             updated_at=cli_meta.get("updated_at"),
+            model_provider=cli_meta.get("model_provider"),
         )
         _apply_source_meta(s)
 
@@ -8010,13 +8012,100 @@ def _lookup_gateway_session_identity(session_id: str) -> dict:
     return metadata if isinstance(metadata, dict) else {}
 
 
+def _model_provider_from_model_config(model_config) -> str:
+    """Extract the provider from a state.db ``model_config`` JSON blob.
+
+    # Local patch 2026-09-14 (provider-bleed). The gateway writes the routing it
+    used into ``sessions.model_config`` (``provider`` at the top level, and again
+    under ``gateway_runtime``); ``billing_provider`` is the cheaper fallback.
+    """
+    raw = model_config
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            raw = raw.decode("utf-8", "replace")
+        except Exception:
+            return ""
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            return ""
+    if not isinstance(raw, dict):
+        return ""
+    runtime = raw.get("gateway_runtime")
+    runtime_provider = runtime.get("provider") if isinstance(runtime, dict) else None
+    for candidate in (raw.get("provider"), runtime_provider):
+        text = str(candidate or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _state_db_session_model_provider(sid: str) -> str:
+    """Return the provider the AGENT actually used for ``sid`` (state.db).
+
+    # Local patch 2026-09-14 (provider-bleed). Imported agent sessions
+    (telegram / cli / cron / other profiles) carry their routing in state.db,
+    never in the WebUI sidecar. Without it the sidecar is created with
+    ``model_provider=None`` and the first write resolves the model against the
+    PROFILE default provider instead of the session's own — a session switched to
+    a cloud model on Telegram then silently runs the LOCAL model while still
+    labelled with the cloud model name (llama-server serves any model name).
+    Returns "" on any error / missing row so callers keep existing behaviour.
+    """
+    if not sid or not is_safe_session_id(sid):
+        return ""
+    try:
+        from api.models import _active_state_db_path
+
+        db_path = _active_state_db_path()
+        if not db_path or not Path(db_path).exists():
+            return ""
+        import sqlite3 as _sqlite
+
+        with closing(_sqlite.connect(str(db_path))) as _conn:
+            row = _conn.execute(
+                "SELECT model_config, billing_provider FROM sessions WHERE id = ?",
+                (sid,),
+            ).fetchone()
+    except Exception:
+        return ""
+    if not row:
+        return ""
+    for candidate in (_model_provider_from_model_config(row[0]), row[1]):
+        provider = _clean_session_model_provider(candidate)
+        if provider:
+            return provider
+    return ""
+
+
+def _with_state_db_model_provider(row):
+    """Backfill ``model_provider`` on an imported agent-session metadata row.
+
+    # Local patch 2026-09-14 (provider-bleed). The state.db projection carries
+    ``model`` but no provider, so every import path (messaging stub, full
+    transcript import, read-only recovery) built a sidecar with
+    ``model_provider=None`` and the first write pinned the profile default.
+    """
+    if not isinstance(row, dict):
+        return row
+    if _clean_session_model_provider(row.get("model_provider")):
+        return row
+    provider = _state_db_session_model_provider(row.get("session_id"))
+    if not provider:
+        return row
+    enriched = dict(row)
+    enriched["model_provider"] = provider
+    return enriched
+
+
 def _lookup_cli_session_metadata(session_id: str, *, all_profiles: bool = False) -> dict:
     if not session_id:
         return {}
     try:
         for row in get_cli_sessions(all_profiles=all_profiles):
             if row.get("session_id") == session_id:
-                return row
+                return _with_state_db_model_provider(row)
     except Exception:
         return {}
     return {}
@@ -16388,6 +16477,7 @@ def handle_post(handler, parsed) -> bool:
                     workspace=get_last_workspace(),
                     messages=[],
                     model=cli_meta.get("model") or "unknown",
+                    model_provider=cli_meta.get("model_provider"),
                     created_at=cli_meta.get("created_at"),
                     updated_at=cli_meta.get("updated_at"),
                 )
@@ -16415,6 +16505,7 @@ def handle_post(handler, parsed) -> bool:
                     profile=cli_meta.get("profile"),
                     created_at=cli_meta.get("created_at"),
                     updated_at=cli_meta.get("updated_at"),
+                    model_provider=cli_meta.get("model_provider"),
                 )
                 s.is_cli_session = is_cli_session_row(cli_meta)
                 s.source_tag = cli_meta.get("source_tag")
@@ -27808,6 +27899,7 @@ def _handle_session_import_cli(handler, body):
         created_at=created_at,
         updated_at=updated_at,
         parent_session_id=cli_parent_session_id,
+        model_provider=(cli_meta or {}).get("model_provider"),
     )
     if cron_project_id:
         s.project_id = cron_project_id
