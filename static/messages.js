@@ -1347,6 +1347,30 @@ function _restoreComposerDraftAfterFailedSend(draftText, filesSnapshot, sid, cle
   return restoredVisible;
 }
 
+// Local patch 2026-09-18 (agent-revision guard): a stale agent revision makes
+// the server re-exec onto the new source automatically (in place, same PID), so
+// the first request can land in the ~4s window and get
+// `409 agent_runtime_stale`. Retry that ONE typed error a few times instead of
+// surfacing a dead end. Bounded on purpose: if the reload is queued behind a
+// long running turn, report honestly rather than hammering the server.
+async function _postChatStartRetryingStale(payload){
+  const delays=[1500,2500,4000,6000];
+  for(let attempt=0;;attempt++){
+    try{
+      return await api('/api/chat/start',{method:'POST',body:JSON.stringify(payload)});
+    }catch(err){
+      // The server's typed error field lives in the RAW body (api() attaches it
+      // as err.body); the human message alone does not carry the token.
+      const errMsg=String((err&&err.message)||'');
+      const errBody=String((err&&err.body)||'');
+      const stale=!!(err&&err.status===409
+        &&(/agent_runtime_stale/.test(errBody)||/agent_runtime_stale/.test(errMsg)));
+      if(!stale||attempt>=delays.length)throw err;
+      await new Promise(resolve=>setTimeout(resolve,delays[attempt]));
+    }
+  }
+}
+
 async function send(){
   // Static guards expect _defaultMessageMode to stay near send() while the actual
   // read remains in the S.busy branch below.
@@ -1797,7 +1821,7 @@ async function send(){
     // pick. (#3739/#3737, Codex catch)
     if(_pendingPickMatch && typeof _clearPendingSessionModel==='function') _clearPendingSessionModel(activeSid);
     explicitPickForPostStart=_explicitPick;
-    const startData=await api('/api/chat/start',{method:'POST',body:JSON.stringify({
+    const startData=await _postChatStartRetryingStale({
       session_id:activeSid,message:msgText,
       // S.session.model remains authoritative; the helper only resolves a
       // matching provider fallback for the same outgoing model.
@@ -1807,7 +1831,7 @@ async function send(){
       explicit_model_pick:_explicitPick||undefined,
       attachments:uploaded.length?uploaded:undefined,
       moa_config:_pendingMoaConfig?true:undefined
-    })});
+    });
     _pendingMoaConfig=null;
     postStartData = startData;
   }catch(e){
@@ -1971,9 +1995,9 @@ async function startRegeneration(sessionId, regenerationRevision){
   if(typeof ensureLiveWorklogShell==='function')ensureLiveWorklogShell();
   else if(typeof appendThinking==='function')appendThinking('',{pending:true});
   try{
-    const response=await api('/api/chat/start',{method:'POST',body:JSON.stringify({
+    const response=await _postChatStartRetryingStale({
       session_id:sid,regenerate:true,regeneration_revision:regenerationRevision
-    })});
+    });
     if(!S.session||S.session.session_id!==sid)return;
     const streamId=response&&response.stream_id;
     if(!streamId)throw new Error('Regeneration did not start a stream.');

@@ -699,6 +699,17 @@ def main() -> None:
     print(f'  Then open:     {scheme}://localhost:{PORT}', flush=True)
     print('', flush=True)
 
+    # Keep the long-lived process honest about which Agent source it loaded. A
+    # HEAD move in ~/.hermes/hermes-agent invalidates the in-process agent
+    # runtime; the fail-closed guard in api/agent_runtime.py detects that on use
+    # and arms an in-place re-exec (same PID, no systemd service restart, waits
+    # for in-flight work). One banner, no polling thread, no timer.
+    try:
+        from api.agent_runtime import loaded_agent_revision_banner
+        print(f'  agent runtime: {loaded_agent_revision_banner()}', flush=True)
+    except Exception as e:
+        print(f'[!!] WARNING: agent runtime banner failed: {e}', flush=True)
+
     # ctl.sh stops the WebUI with SIGTERM. Python's default SIGTERM handler
     # terminates the process WITHOUT unwinding the try/finally around
     # serve_forever(), so drain_all_on_shutdown() (which flushes in-flight
