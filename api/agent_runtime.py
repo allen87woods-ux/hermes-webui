@@ -40,6 +40,32 @@ _RESTART_MESSAGE_BUSY = (
 )
 
 
+# Local patch 2026-09-24 (TSK-143 / webui patch #15): the WebUI process builds
+# its agents in-process, and upstream never calls
+# agent.shell_hooks.register_from_config() for it, so a ``hooks:`` block in
+# ~/.hermes/config.yaml (e.g. the pre_tool_call risk guard) was silently inert
+# on every WebUI surface.  Register the configured shell hooks at boot —
+# same pattern as gateway/run_startup.py.  Idempotent (the shell_hooks module
+# keeps its own registered-key set), fail-open on any error: a hook wiring
+# problem must never break WebUI startup.
+_HOOKS_REGISTERED = False
+
+
+def register_configured_shell_hooks() -> None:
+    """Wire the config's ``hooks:`` block into this process (once)."""
+    global _HOOKS_REGISTERED
+    if _HOOKS_REGISTERED:
+        return
+    _HOOKS_REGISTERED = True
+    try:
+        from hermes_cli.config import load_config
+        from agent.shell_hooks import register_from_config
+
+        register_from_config(load_config())
+    except Exception as exc:  # never break WebUI startup over hook wiring
+        print(f"[!!] shell-hook registration failed (non-fatal): {exc}", flush=True)
+
+
 def _read_agent_revision(
     agent_dir: Path | None,
     *,

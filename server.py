@@ -710,6 +710,18 @@ def main() -> None:
     except Exception as e:
         print(f'[!!] WARNING: agent runtime banner failed: {e}', flush=True)
 
+    # Local patch 2026-09-24 (TSK-143 / webui patch #15): wire the config's
+    # shell hooks (hooks: block) into this process.  Without this the WebUI
+    # surface was the only one where the pre_tool_call risk guard was inert.
+    # Runs after verify_hermes_imports() above, so the agent dir is on
+    # sys.path; non-fatal by design (register_configured_shell_hooks
+    # swallows its own errors).
+    try:
+        from api.agent_runtime import register_configured_shell_hooks
+        register_configured_shell_hooks()
+    except Exception as e:
+        print(f'[!!] WARNING: shell-hook registration failed: {e}', flush=True)
+
     # ctl.sh stops the WebUI with SIGTERM. Python's default SIGTERM handler
     # terminates the process WITHOUT unwinding the try/finally around
     # serve_forever(), so drain_all_on_shutdown() (which flushes in-flight
