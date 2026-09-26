@@ -28030,7 +28030,7 @@ def _mcp_runtime_status_by_name() -> dict[str, dict]:
     is unavailable, fall back to an empty map so the API remains safe.
     """
     try:
-        from tools.mcp_tool import get_mcp_status
+        from tools.mcp_tool_discovery import get_mcp_status
         statuses = get_mcp_status()
     except Exception:
         return {}

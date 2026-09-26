@@ -2812,7 +2812,7 @@ def _set_turn_session_identity(session_id: str):
     sid = str(session_id or "")
     tokens: dict = {}
     try:
-        from tools.approval import set_current_session_key
+        from tools.approval_context import set_current_session_key
         tokens["approval"] = set_current_session_key(sid)
     except Exception:
         logger.debug("per-turn approval session-key bind failed", exc_info=True)
@@ -2857,7 +2857,7 @@ def _reset_turn_session_identity(tokens) -> None:
     tok = tokens.get("approval")
     if tok is not None:
         try:
-            from tools.approval import reset_current_session_key
+            from tools.approval_context import reset_current_session_key
             reset_current_session_key(tok)
         except Exception:
             logger.debug("per-turn approval session-key reset failed", exc_info=True)
@@ -9409,7 +9409,7 @@ def _run_agent_streaming(
         # lives outside this WebUI repo.  This change fixes the headline bug
         # for users who run a single non-default profile per WebUI process.
         try:
-            from tools.mcp_tool import discover_mcp_tools
+            from tools.mcp_tool_discovery import discover_mcp_tools
             discover_mcp_tools()
         except Exception:
             pass  # MCP not available or not configured — non-fatal
