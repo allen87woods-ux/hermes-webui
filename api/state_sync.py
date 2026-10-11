@@ -348,6 +348,43 @@ def sync_session_title_manual(session_id: str, title: str, profile: Optional[str
             logger.debug("Failed to close state.db")
 
 
+def _ensure_state_db_row(db, session_id: str, profile: Optional[str] = None) -> bool:
+    """Create the state.db row for a WebUI session that does not have one yet.
+
+    Local patch #24 (2026-10-11, Allen: "make them visible just in case"): a chat
+    created in the WebUI exists only as a sidecar until the agent actually runs a
+    turn in it. state.db -- and therefore Hermes Desktop -- cannot see it, and a
+    pin/archive/rename made here has nowhere to mirror to. The mirror is the moment
+    the Desktop needs the row, so mint it there.
+
+    Uses the agent's own ``ensure_session()`` upsert, which never overwrites a field
+    an earlier writer set: if the agent already materialized the session this is a
+    no-op. ``cwd`` is deliberately left unset -- every existing webui row has NULL
+    cwd (513/513 measured) and the Desktop lists them all fine.
+    """
+    try:
+        db.ensure_session(session_id, "webui", profile_name=profile or None)
+        return True
+    except Exception:
+        logger.warning("state_sync: could not materialize %s for the Desktop",
+                       session_id, exc_info=True)
+        return False
+
+
+def _write_flag(db, session_id: str, attr: str, value: bool,
+                profile: Optional[str] = None) -> bool:
+    """Write one flag, materializing the row first if the session has none."""
+    setter = db.set_session_pinned if attr == "pinned" else db.set_session_archived
+    for attempt in ("write", "materialize+retry"):
+        if setter(session_id, value):
+            _record_push(session_id, attr, bool(value))
+            return True
+        if attempt == "materialize+retry" or not _ensure_state_db_row(db, session_id, profile):
+            break
+    logger.warning("state_sync: no state.db row matched %s=%s for %s", attr, value, session_id)
+    return False
+
+
 def sync_session_flags(session_id: str, *, pinned: Optional[bool] = None,
                        archived: Optional[bool] = None,
                        profile: Optional[str] = None) -> None:
@@ -370,17 +407,9 @@ def sync_session_flags(session_id: str, *, pinned: Optional[bool] = None,
         return
     try:
         if pinned is not None:
-            if not db.set_session_pinned(session_id, bool(pinned)):
-                logger.warning(
-                    "state_sync: no state.db row matched pinned=%s for %s", pinned, session_id)
-            else:
-                _record_push(session_id, "pinned", bool(pinned))
+            _write_flag(db, session_id, "pinned", bool(pinned), profile)
         if archived is not None:
-            if not db.set_session_archived(session_id, bool(archived)):
-                logger.warning(
-                    "state_sync: no state.db row matched archived=%s for %s", archived, session_id)
-            else:
-                _record_push(session_id, "archived", bool(archived))
+            _write_flag(db, session_id, "archived", bool(archived), profile)
     except Exception:
         logger.debug("Failed to sync session flags to state.db for %s", session_id)
     finally:
