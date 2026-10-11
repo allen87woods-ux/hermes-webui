@@ -197,19 +197,43 @@ def sync_session_usage(session_id: str, input_tokens: int=0, output_tokens: int=
             logger.debug("Failed to close state.db")
 
 
+def _push_title(db, session_id: str, title: str, *, user: bool) -> bool:
+    """Write one title into state.db, deriving a lineage variant if the UNIQUE
+    ``idx_sessions_title_unique`` rejects it (two conversations may legitimately
+    want the same name; the second becomes "<title> #2")."""
+    def _write(text: str) -> bool:
+        if user:
+            return bool(db.set_session_title(session_id, text))
+        return bool(db.set_auto_title(session_id, text, source=db.TITLE_SOURCE_LLM))
+
+    try:
+        return _write(title)
+    except ValueError:
+        try:
+            alt = db.get_next_title_in_lineage(title)
+        except Exception:
+            return False
+        return bool(alt and alt != title and _write(alt))
+
+
 def sync_session_title(session_id: str, title: str, profile: Optional[str] = None) -> None:
     """Sync an auto-generated title to state.db (not gated by sync_to_insights).
 
     Background title generation writes the title to the WebUI sidecar JSON but
-    not to hermes-agent's state.db, so ``hermes sessions list`` shows blank
-    titles for WebUI sessions.  This function bridges that gap and is called
-    from the background title update/refresh paths after a title is persisted.
+    not to hermes-agent's state.db, so ``hermes sessions list`` (and the Desktop
+    app's session list) shows a different name for the same conversation.
 
-    Uses ``set_auto_title_if_empty`` so it will only populate a NULL title and
-    never overwrite a manual rename made via CLI/Gateway/TUI.  This means
-    title refreshes (where state.db already holds the initial auto-title) are
-    effectively no-ops at the state.db layer -- acceptable because the primary
-    goal is ensuring ``hermes sessions list`` is not blank.
+    Local patch #20 (2026-10-11) — this used to be ``set_auto_title_if_empty``,
+    which fills a NULL title and then stops. The observable effect was that the
+    WebUI's title and the Desktop's title drifted apart permanently for any
+    conversation the agent had already auto-titled (measured: 322 of 524 WebUI
+    sessions), so the two surfaces listed the same chat under two names.
+
+    Now: fill when untitled, and when state.db already holds an automatic title
+    that differs, upgrade it to the WebUI's text. Provenance is respected in both
+    directions — a ``user`` title (a human named it via CLI/TUI/gateway/Desktop)
+    is NEVER overwritten, and an automatic title is written as ``llm`` so it keeps
+    its honest rank and stays replaceable.
 
     On a title collision (two sessions with the same auto-title), the title is
     de-duplicated via ``get_next_title_in_lineage`` (e.g. "My Session" ->
@@ -224,17 +248,100 @@ def sync_session_title(session_id: str, title: str, profile: Optional[str] = Non
         # Ensure the session row exists (idempotent) so the UPDATE has a target.
         db.ensure_session(session_id=session_id, source='webui')
         try:
-            db.set_auto_title_if_empty(session_id, title)
-        except ValueError:
-            # state.db enforces uniqueness on sessions.title, so a byte-identical
-            # auto-title generated for two sessions raises ValueError here. Derive
-            # a de-duplicated variant (e.g. "My Session" -> "My Session #2") and
-            # retry instead of leaving the second row blank (#6964).
-            alt = db.get_next_title_in_lineage(title)
-            if alt and alt != title:
-                db.set_auto_title_if_empty(session_id, alt)
+            current = db.get_session_title(session_id)
+            source = db.get_session_title_source(session_id)
+        except Exception:
+            current, source = None, None
+        if source == db.TITLE_SOURCE_USER:
+            # A human named this conversation elsewhere; the sidecar is the stale
+            # side, not state.db.
+            return
+        if current == title:
+            return
+        if source is not None:
+            # An automatic title (llm/derived) already holds the row and the ranks
+            # are equal, so a plain re-write would be a no-op by design. Drop the
+            # provenance one rank so the WebUI's newer title can land as ``llm``.
+            try:
+                db.set_session_title_source(session_id, db.TITLE_SOURCE_DERIVED)
+            except Exception:
+                return
+        _push_title(db, session_id, title, user=False)
     except Exception:
         logger.debug("Failed to sync session title to state.db for %s", session_id)
+    finally:
+        try:
+            db.close()
+        except Exception:
+            logger.debug("Failed to close state.db")
+
+
+def sync_session_title_manual(session_id: str, title: str, profile: Optional[str] = None) -> None:
+    """Mirror a MANUAL WebUI rename into state.db under ``user`` authority.
+
+    Local patch #20 (2026-10-11). ``/api/session/rename`` wrote only the sidecar,
+    so a session renamed in the WebUI kept its old auto-title in state.db and the
+    Desktop app listed it under that old name (live case: a session renamed
+    "Pyrowave" showed up in the Desktop as "Household high speed internet
+    benefits" — i.e. looked like it was missing).
+
+    ``TITLE_SOURCE_USER`` outranks every automatic title, so this always lands
+    (``_set_session_title`` allows a user write over any provenance), and it also
+    protects the name from later automatic re-titling on either surface.
+
+    Best effort: never raises into the request path.
+    """
+    if not title:
+        return
+    db = _get_state_db(profile=profile)
+    if not db:
+        return
+    try:
+        db.ensure_session(session_id=session_id, source='webui')
+        current = db.get_session_title(session_id)
+        if current == title and db.get_session_title_source(session_id) == db.TITLE_SOURCE_USER:
+            return
+        _push_title(db, session_id, title, user=True)
+    except Exception:
+        logger.debug("Failed to sync manual title to state.db for %s", session_id)
+    finally:
+        try:
+            db.close()
+        except Exception:
+            logger.debug("Failed to close state.db")
+
+
+def sync_session_flags(session_id: str, *, pinned: Optional[bool] = None,
+                       archived: Optional[bool] = None,
+                       profile: Optional[str] = None) -> None:
+    """Mirror a WebUI pin/archive toggle into the agent state.db.
+
+    The WebUI keeps pin/archive in its own sidecar JSON, but the Desktop app and
+    every ``hermes serve`` backend read those two flags from state.db
+    (``hermes_cli/web_routers/sessions.py``: GET ``/api/sessions``,
+    PATCH ``/api/sessions/{id}``). Without this bridge a pin or archive made on
+    the phone is invisible on the Desktop -- and vice versa for a pin made there.
+
+    Both flags ride the agent's own lineage-wide UPDATE (a compression lineage is
+    ONE conversation, so continuation siblings and subagent children follow the
+    root). Idempotent and best effort: never raises into the request path.
+    """
+    if pinned is None and archived is None:
+        return
+    db = _get_state_db(profile=profile)
+    if not db:
+        return
+    try:
+        if pinned is not None:
+            if not db.set_session_pinned(session_id, bool(pinned)):
+                logger.warning(
+                    "state_sync: no state.db row matched pinned=%s for %s", pinned, session_id)
+        if archived is not None:
+            if not db.set_session_archived(session_id, bool(archived)):
+                logger.warning(
+                    "state_sync: no state.db row matched archived=%s for %s", archived, session_id)
+    except Exception:
+        logger.debug("Failed to sync session flags to state.db for %s", session_id)
     finally:
         try:
             db.close()
