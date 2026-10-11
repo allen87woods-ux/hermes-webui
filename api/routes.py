@@ -15032,6 +15032,21 @@ def handle_post(handler, parsed) -> bool:
             from api.session_ops import apply_session_title_rename
             apply_session_title_rename(s, body["title"])
             s.save()
+        # Local patch #20 (2026-10-11): mirror the rename into state.db under user
+        # authority. Without this the sidecar carried the new name while state.db
+        # kept the old auto-title, so Hermes Desktop and `hermes sessions list`
+        # listed the conversation under a different name (live case: a session
+        # renamed "Pyrowave" appeared in the Desktop as "Household high speed
+        # internet benefits", which reads as "the session is missing").
+        try:
+            from api.state_sync import sync_session_title_manual
+            sync_session_title_manual(
+                getattr(s, "session_id", body["session_id"]),
+                getattr(s, "title", body["title"]),
+                profile=getattr(s, "profile", None) or "default",
+            )
+        except Exception:
+            pass
         _sync_session_title_to_insights(s)
         publish_session_list_changed(
             "session_rename",
@@ -15151,14 +15166,34 @@ def handle_post(handler, parsed) -> bool:
         def _draft_mark(name):
             _draft_stages.append((name, _draft_time.monotonic()))
         _draft_mark("enter")
+
+        # Transient resolve retry (2026-10-10): a 10:00 EDT burst showed 34
+        # draft autosaves 404-ing in 33s while the session file existed on
+        # disk. A full sidecar load can be mid-flight under the single-flight
+        # slot budget, so a brief retry recovers what would otherwise be a
+        # silently dropped in-progress draft. Log the sid on final failure
+        # (the access log does not carry POST bodies).
+        def _resolve_for_draft(_sid):
+            _tries = 3
+            for _i in range(_tries):
+                try:
+                    return get_session(_sid)
+                except KeyError:
+                    if _i == _tries - 1:
+                        logger.warning(
+                            "[draft] session %s unresolvable after %d tries; autosave dropped",
+                            _sid, _tries,
+                        )
+                    else:
+                        _draft_time.sleep(0.25 * (_i + 1))
+            return None
         if handler.command == "GET":
             query = parse_qs(parsed.query)
             sid = query.get("session_id", [""])[0] if parsed.query else ""
             if not sid:
                 return bad(handler, "session_id is required", 400)
-            try:
-                s = get_session(sid)
-            except KeyError:
+            s = _resolve_for_draft(sid)
+            if s is None:
                 return bad(handler, "Session not found", 404)
             draft = getattr(s, "composer_draft", {}) or {}
             return j(handler, {"draft": draft})
@@ -15186,9 +15221,8 @@ def handle_post(handler, parsed) -> bool:
             files = []
         if isinstance(files, list) and len(files) > _MAX_DRAFT_FILES:
             files = files[:_MAX_DRAFT_FILES]
-        try:
-            s = get_session(sid)
-        except KeyError:
+        s = _resolve_for_draft(sid)
+        if s is None:
             return bad(handler, "Session not found", 404)
         _draft_mark("after_get_session")
         unchanged = False
@@ -16429,6 +16463,17 @@ def handle_post(handler, parsed) -> bool:
             with _get_session_agent_lock(body["session_id"]):
                 s.pinned = pin_requested
                 s.save()
+        # Mirror the toggle into state.db so the Desktop app / serve backend
+        # (which reads pin state from there) shows the same pinned set.
+        try:
+            from api.state_sync import sync_session_flags
+            sync_session_flags(
+                getattr(s, "session_id", body["session_id"]),
+                pinned=bool(getattr(s, "pinned", pin_requested)),
+                profile=getattr(s, "profile", None),
+            )
+        except Exception:
+            pass
         publish_session_list_changed(
             "session_pin",
             profile=getattr(s, "profile", None),
@@ -16521,6 +16566,17 @@ def handle_post(handler, parsed) -> bool:
         with _get_session_agent_lock(sid):
             s.archived = bool(body.get("archived", True))
             s.save(touch_updated_at=False)
+        # Mirror the toggle into state.db so the Desktop app / serve backend
+        # (which reads archive state from there) hides and shows the same set.
+        try:
+            from api.state_sync import sync_session_flags
+            sync_session_flags(
+                sid,
+                archived=bool(getattr(s, "archived", True)),
+                profile=getattr(s, "profile", None),
+            )
+        except Exception:
+            pass
         publish_session_list_changed(
             "session_archive",
             profile=getattr(s, "profile", None),
