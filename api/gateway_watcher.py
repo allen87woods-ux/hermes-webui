@@ -234,6 +234,10 @@ class GatewayWatcher:
         # #18 writes state.db after the sidecar), so never adopt over a fresh one.
         self.SIDECAR_SETTLE_SECS = 10.0
 
+    # Returned by the adopt helpers when the freshness guard refused to look at a
+    # change. The caller must then NOT consume that change (see _adopt_db_flags).
+    _ADOPT_DEFERRED = 'deferred'
+
     def start(self):
         """Start the watcher daemon thread."""
         if self._thread and self._thread.is_alive():
@@ -428,24 +432,39 @@ class GatewayWatcher:
         if flags is None:
             return []
         prev = self._db_flag_snapshot
-        self._db_flag_snapshot = flags
         boot_sweep = not prev
-        candidates = flags.items() if boot_sweep else (
-            (sid, value) for sid, value in flags.items() if prev.get(sid) != value)
+        snapshot: dict[str, tuple[bool, bool]] = {}
         adopted = []
-        for sid, value in candidates:
+        for sid, value in flags.items():
+            if not boot_sweep and prev.get(sid) == value:
+                snapshot[sid] = value
+                continue
             try:
-                if self._adopt_one(sid, *value):
-                    adopted.append(sid)
+                result = self._adopt_one(sid, *value)
             except Exception:
                 logger.debug("flag-sync: adopt failed for %s", sid, exc_info=True)
+                result = False
+            if result == self._ADOPT_DEFERRED:
+                # Freshness guard refused to look at it -- do NOT consume the
+                # change. Holding the previous value here re-detects the same
+                # transition on the next pass; advancing the snapshot instead
+                # dropped the change permanently (found live 2026-10-11: a Desktop
+                # flip landing within the 10s settle window of a WebUI toggle was
+                # lost, leaving the two stores disagreeing until the next edit).
+                if sid in prev:
+                    snapshot[sid] = prev[sid]
+                continue
+            snapshot[sid] = value
+            if result:
+                adopted.append(sid)
+        self._db_flag_snapshot = snapshot
         if adopted:
             logger.info("flag-sync: %s adopted %d flag(s) changed outside the WebUI: %s",
                         "boot sweep" if boot_sweep else "transition",
                         len(adopted), ", ".join(adopted[:5]))
         return adopted
 
-    def _adopt_one(self, session_id: str, pinned: bool, archived: bool) -> bool:
+    def _adopt_one(self, session_id: str, pinned: bool, archived: bool) -> bool | str:
         """Write one externally-changed flag pair into its sidecar, if one exists."""
         try:
             from api.config import SESSION_DIR, _get_session_agent_lock
@@ -473,7 +492,7 @@ class GatewayWatcher:
             if time.time() - sidecar.stat().st_mtime < self.SIDECAR_SETTLE_SECS:
                 # Written moments ago: patch #18 writes state.db right after the
                 # sidecar, so this may be our own in-flight toggle, not theirs.
-                return False
+                return self._ADOPT_DEFERRED
         except OSError:
             return False
         try:
@@ -554,26 +573,38 @@ class GatewayWatcher:
         if titles is None:
             return []
         prev = self._db_title_snapshot
-        self._db_title_snapshot = titles
         boot_sweep = not prev
-        candidates = titles.items() if boot_sweep else (
-            (sid, value) for sid, value in titles.items() if prev.get(sid) != value)
+        snapshot: dict[str, tuple] = {}
         adopted = []
-        for sid, (title, source) in candidates:
+        for sid, (title, source) in titles.items():
             if source != 'user' or not title:
+                snapshot[sid] = (title, source)
+                continue
+            if not boot_sweep and prev.get(sid) == (title, source):
+                snapshot[sid] = (title, source)
                 continue
             try:
-                if self._adopt_title_one(sid, title):
-                    adopted.append(sid)
+                result = self._adopt_title_one(sid, title)
             except Exception:
                 logger.debug("flag-sync: title adopt failed for %s", sid, exc_info=True)
+                result = False
+            if result == self._ADOPT_DEFERRED:
+                # Same rule as the flag pass: a change the freshness guard skipped
+                # must stay unconsumed so the next pass retries it.
+                if sid in prev:
+                    snapshot[sid] = prev[sid]
+                continue
+            snapshot[sid] = (title, source)
+            if result:
+                adopted.append(sid)
+        self._db_title_snapshot = snapshot
         if adopted:
             logger.info("flag-sync: %s adopted %d renamed session(s): %s",
                         "boot sweep" if boot_sweep else "transition",
                         len(adopted), ", ".join(adopted[:5]))
         return adopted
 
-    def _adopt_title_one(self, session_id: str, title: str) -> bool:
+    def _adopt_title_one(self, session_id: str, title: str) -> bool | str:
         try:
             from api.config import SESSION_DIR, _get_session_agent_lock
             from api.models import get_session
