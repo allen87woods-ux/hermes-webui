@@ -7571,7 +7571,14 @@ function _partitionSidebarSessionRows(allMatched, activeSidForSidebar){
       if(isCli) cliArchivedCount++;
       else webuiArchivedCount++;
     }
-    if(!_showArchived&&s.archived) continue;
+    // Local patch #22 (2026-10-11): a PIN survives archiving. An archived row
+    // still joins the visible rows when it is pinned, so the star group can list
+    // it -- exactly what Hermes Desktop does (its listing asks for
+    // include_pinned=True). Dropping it here made a pin set on the Desktop (or on
+    // an archived conversation here) invisible on this surface, which read as
+    // "the two are not syncing" even though the stores agreed. Unpinned archived
+    // rows are still hidden unless "Show archived" is on.
+    if(!_showArchived&&s.archived&&!s.pinned) continue;
     sessionsRaw.push(s);
   }
   if(_sessionSourceFilter==='cli' && !window._showCliSessions && cliSessionCount===0){
