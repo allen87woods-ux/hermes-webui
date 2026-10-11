@@ -384,6 +384,18 @@ class GatewayWatcher:
     # excludes source='webui' rows (_WATCHER_EXCLUDED_SOURCES), so a flag change on
     # a WebUI-owned session is invisible to the change gate above and would never
     # reach the projection at all.
+    def _read_sidecar_flags(self, session_id: str):
+        """``(pinned, archived)`` as stored in the WebUI sidecar, or None."""
+        try:
+            from api.config import SESSION_DIR
+            path = Path(SESSION_DIR) / f"{session_id}.json"
+            if not path.exists():
+                return None
+            data = json.loads(path.read_text())
+        except Exception:
+            return None
+        return (bool(data.get('pinned')), bool(data.get('archived')))
+
     def _read_db_flags(self) -> dict | None:
         """``{session_id: (pinned, archived)}`` for every listable state.db row."""
         db_path = self._state_db_path
@@ -435,8 +447,36 @@ class GatewayWatcher:
         boot_sweep = not prev
         snapshot: dict[str, tuple[bool, bool]] = {}
         adopted = []
+        try:
+            from api.state_sync import pushed_recently, clear_pushes
+        except Exception:
+            pushed_recently = clear_pushes = None
         for sid, value in flags.items():
-            if not boot_sweep and prev.get(sid) == value:
+            changed = prev.get(sid) != value
+            attributed = False
+            if not changed and not boot_sweep and pushed_recently is not None:
+                # Local patch #23: nothing moved since our last sample, but we know
+                # what WE last wrote. If state.db no longer holds it while the
+                # sidecar still does, an external write replaced it. Two opposite
+                # edits inside one 5s interval cancel out and are otherwise
+                # invisible forever -- this is what catches them.
+                pushes = pushed_recently(sid)
+                if pushes:
+                    on_disk = self._read_sidecar_flags(sid)
+                    if on_disk is not None and on_disk == value and clear_pushes is not None:
+                        # Already consistent: our push needs no adoption and there
+                        # is nothing left to attribute, so stop carrying it.
+                        try:
+                            clear_pushes(sid)
+                        except Exception:
+                            pass
+                    elif on_disk is not None and on_disk != value:
+                        for attr, (pushed_value, _age) in pushes.items():
+                            idx = 0 if attr == 'pinned' else 1
+                            if on_disk[idx] == pushed_value and value[idx] != pushed_value:
+                                attributed = True
+                                break
+            if not changed and not attributed:
                 snapshot[sid] = value
                 continue
             try:
@@ -457,6 +497,13 @@ class GatewayWatcher:
             snapshot[sid] = value
             if result:
                 adopted.append(sid)
+                if clear_pushes is not None:
+                    # Consumed: the sidecar now matches the db, so there is nothing
+                    # left to attribute.
+                    try:
+                        clear_pushes(sid)
+                    except Exception:
+                        pass
         self._db_flag_snapshot = snapshot
         if adopted:
             logger.info("flag-sync: %s adopted %d flag(s) changed outside the WebUI: %s",

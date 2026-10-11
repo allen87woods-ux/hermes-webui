@@ -15,8 +15,45 @@ any double-counting risk.
 """
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Optional
+
+# ── Local patch #23 (2026-10-11): push attribution for the flag bridge ─────────
+# The inbound watcher (api/gateway_watcher.py) adopts state.db changes into the
+# sidecars, but a difference it never SEES cannot be attributed: two opposite
+# edits to the same session inside one watcher interval (5s) cancel out, so
+# state.db looks unchanged and the WebUI side keeps its value -- the Desktop's
+# edit was silently lost. Recording what we successfully pushed lets the watcher
+# read the asymmetry: if state.db no longer holds the value WE wrote, someone
+# else changed it afterwards, so the db is newer and wins.
+PUSH_LEDGER: dict = {}
+PUSH_LEDGER_MAX_AGE = 600.0
+_PUSH_LEDGER_MAX_ENTRIES = 200
+
+
+def _record_push(session_id: str, attr: str, value: bool) -> None:
+    entry = PUSH_LEDGER.setdefault(str(session_id), {})
+    entry[attr] = (bool(value), time.time())
+    if len(PUSH_LEDGER) > _PUSH_LEDGER_MAX_ENTRIES:
+        # drop the oldest sessions, never the newest pushes
+        order = sorted(PUSH_LEDGER, key=lambda k: max(t for _, t in PUSH_LEDGER[k].values()))
+        for key in order[: len(PUSH_LEDGER) - _PUSH_LEDGER_MAX_ENTRIES]:
+            PUSH_LEDGER.pop(key, None)
+
+
+def pushed_recently(session_id: str, max_age: float = PUSH_LEDGER_MAX_AGE) -> dict:
+    """``{attr: (value, age_seconds)}`` for pushes that actually landed."""
+    entry = PUSH_LEDGER.get(str(session_id))
+    if not entry:
+        return {}
+    now = time.time()
+    return {attr: (value, round(now - at, 1))
+            for attr, (value, at) in entry.items() if now - at <= max_age}
+
+
+def clear_pushes(session_id: str) -> None:
+    PUSH_LEDGER.pop(str(session_id), None)
 
 logger = logging.getLogger(__name__)
 
@@ -336,10 +373,14 @@ def sync_session_flags(session_id: str, *, pinned: Optional[bool] = None,
             if not db.set_session_pinned(session_id, bool(pinned)):
                 logger.warning(
                     "state_sync: no state.db row matched pinned=%s for %s", pinned, session_id)
+            else:
+                _record_push(session_id, "pinned", bool(pinned))
         if archived is not None:
             if not db.set_session_archived(session_id, bool(archived)):
                 logger.warning(
                     "state_sync: no state.db row matched archived=%s for %s", archived, session_id)
+            else:
+                _record_push(session_id, "archived", bool(archived))
     except Exception:
         logger.debug("Failed to sync session flags to state.db for %s", session_id)
     finally:
