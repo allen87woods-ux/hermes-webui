@@ -4091,7 +4091,10 @@ function _sessionSnapshotById(sid){
   return (_allSessions||[]).find(s=>s&&s.session_id===sid)||null;
 }
 function _pinnedSessionCount(){
-  return (_allSessions||[]).filter(s=>s&&s.pinned&&!s.archived).length;
+  // Local patch #21 (2026-10-11): count pins the way the Desktop does -- a pin
+  // survives archiving. Requiring "not archived" here hid every archived pin and
+  // silently undercounted against pinned_sessions_limit.
+  return (_allSessions||[]).filter(s=>s&&s.pinned).length;
 }
 function _getPinnedSessionsLimit(){
   const limit=parseInt(window._pinnedSessionsLimit||3,10);

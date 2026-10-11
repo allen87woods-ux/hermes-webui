@@ -2541,6 +2541,23 @@ def _build_session_list_cache_payload(
     visible_scoped_filtered = _filter_sidebar_source(visible_scoped)
     archived_scoped_filtered = _filter_sidebar_source(archived_scoped)
     scoped = _filter_sidebar_source(full_scoped_all_sources)
+    if not include_archived:
+        # Local patch #21 (2026-10-11): a PIN survives archiving, exactly as it does
+        # on the Desktop (hermes_cli's listing calls list_sessions_rich with
+        # include_pinned=True). This payload used to carry active rows only, and the
+        # client-side pinned filter additionally demanded "not archived", so a
+        # session pinned in Hermes Desktop while archived had NO surface in the
+        # sidebar at all -- first case: 4 pins on the Desktop, 2 visible here, and
+        # the missing ones looked like a sync failure (they had in fact synced).
+        # Appended to `scoped` rather than merged into visible_scoped so the session
+        # counts and the on-demand archived page stay exactly as they were; the
+        # client renders pins as their own group, so nothing is listed twice.
+        _pinned_archived_rows = [
+            s for s in archived_scoped_filtered
+            if s.get("pinned") and s.get("archived")
+        ]
+        if _pinned_archived_rows:
+            scoped = scoped + _pinned_archived_rows
     if include_archived and archived_limit is not None:
         try:
             normalized_archived_limit = max(0, int(archived_limit))
