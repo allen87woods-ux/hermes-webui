@@ -239,6 +239,23 @@ class GatewayWatcher:
         # (issue #3506). Empty string forces the first poll to run the full read.
         self._last_cheap_fp: str = ''
         self._last_full_projection_at: float | None = None
+        # Local patch 2026-10-11 (#19): last-seen ``{id: (pinned, archived)}`` from
+        # state.db. Inbound flag sync acts only on TRANSITIONS (patches #18's mirror
+        # is one-way), so this baseline is what makes "who changed it" answerable
+        # without timestamps: a change here that the WebUI never made is external.
+        self._db_flag_snapshot: dict[str, tuple[bool, bool]] = {}
+        # Local patch 2026-10-11 (#20): same idea for titles -- ``{id: (title,
+        # title_source)}``. A title changed outside the WebUI (Hermes Desktop's
+        # rename, ``hermes sessions`` / CLI /title, the TUI) is adopted into the
+        # sidecar so both surfaces list the same name.
+        self._db_title_snapshot: dict[str, tuple] = {}
+        # A sidecar written less than this long ago may still be mid-toggle (patch
+        # #18 writes state.db after the sidecar), so never adopt over a fresh one.
+        self.SIDECAR_SETTLE_SECS = 10.0
+
+    # Returned by the adopt helpers when the freshness guard refused to look at a
+    # change. The caller must then NOT consume that change (see _adopt_db_flags).
+    _ADOPT_DEFERRED = 'deferred'
 
     def start(self):
         """Start the watcher daemon thread."""
@@ -403,6 +420,335 @@ class GatewayWatcher:
             self._notify_subscribers(sessions, epoch=admission_epoch)
         return True
 
+    # ── Local patch 2026-10-11 (#19): inbound flag sync (Desktop -> WebUI) ──
+    #
+    # Patch #18 mirrors a WebUI pin/archive toggle INTO state.db. Nothing mirrored
+    # the other way, so a pin or archive made in Hermes Desktop (PATCH
+    # /api/sessions/{id} over ``hermes serve``), by ``hermes sessions archive``, or
+    # by the gateway left the WebUI sidecar stale and the two libraries disagreed.
+    #
+    # This pass adopts an externally-changed state.db flag into the sidecar that
+    # backs it. It runs on its own cadence: the cheap fingerprint explicitly
+    # excludes source='webui' rows (_WATCHER_EXCLUDED_SOURCES), so a flag change on
+    # a WebUI-owned session is invisible to the change gate above and would never
+    # reach the projection at all.
+    def _read_sidecar_flags(self, session_id: str):
+        """``(pinned, archived)`` as stored in the WebUI sidecar, or None."""
+        try:
+            from api.config import SESSION_DIR
+            path = Path(SESSION_DIR) / f"{session_id}.json"
+            if not path.exists():
+                return None
+            data = json.loads(path.read_text())
+        except Exception:
+            return None
+        return (bool(data.get('pinned')), bool(data.get('archived')))
+
+    def _read_db_flags(self) -> dict | None:
+        """``{session_id: (pinned, archived)}`` for every listable state.db row."""
+        db_path = self._state_db_path
+        if not db_path.exists():
+            return None
+        try:
+            with closing(open_state_db_readonly(db_path)) as conn:
+                cols = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+                if not {'id', 'pinned', 'archived'} <= cols:
+                    return None
+                rows = conn.execute(
+                    "SELECT id, pinned, archived FROM sessions "
+                    "WHERE source IS NOT NULL AND source != 'subagent'").fetchall()
+            return {str(r[0]): (bool(r[1]), bool(r[2])) for r in rows}
+        except Exception:
+            logger.debug("flag-sync: state.db flag read failed", exc_info=True)
+            return None
+
+    def _read_db_flags_for(self, session_id: str) -> tuple[bool, bool] | None:
+        """Re-read one row's flags (used under the session lock, post-transition)."""
+        db_path = self._state_db_path
+        if not db_path.exists():
+            return None
+        try:
+            with closing(open_state_db_readonly(db_path)) as conn:
+                row = conn.execute(
+                    "SELECT pinned, archived FROM sessions WHERE id = ?",
+                    (session_id,)).fetchone()
+            return (bool(row[0]), bool(row[1])) if row else None
+        except Exception:
+            return None
+
+    def _adopt_db_flags(self) -> list:
+        """Adopt externally-changed pin/archive flags into WebUI sidecars.
+
+        Returns the adopted session ids.
+
+        Two modes. The FIRST pass after boot sweeps every sidecar-backed row (a
+        change made while the WebUI was down has no transition to observe, so
+        transitions alone would miss it). Later passes act on TRANSITIONS only: a
+        row whose state.db value did not move is never touched, which is what keeps
+        a failed patch-#18 mirror from being read as an external change and
+        reverted.
+        """
+        flags = self._read_db_flags()
+        if flags is None:
+            return []
+        prev = self._db_flag_snapshot
+        boot_sweep = not prev
+        snapshot: dict[str, tuple[bool, bool]] = {}
+        adopted = []
+        try:
+            from api.state_sync import pushed_recently, clear_pushes
+        except Exception:
+            pushed_recently = clear_pushes = None
+        for sid, value in flags.items():
+            changed = prev.get(sid) != value
+            attributed = False
+            if not changed and not boot_sweep and pushed_recently is not None:
+                # Local patch #23: nothing moved since our last sample, but we know
+                # what WE last wrote. If state.db no longer holds it while the
+                # sidecar still does, an external write replaced it. Two opposite
+                # edits inside one 5s interval cancel out and are otherwise
+                # invisible forever -- this is what catches them.
+                pushes = pushed_recently(sid)
+                if pushes:
+                    on_disk = self._read_sidecar_flags(sid)
+                    if on_disk is not None and on_disk == value and clear_pushes is not None:
+                        # Already consistent: our push needs no adoption and there
+                        # is nothing left to attribute, so stop carrying it.
+                        try:
+                            clear_pushes(sid)
+                        except Exception:
+                            pass
+                    elif on_disk is not None and on_disk != value:
+                        for attr, (pushed_value, _age) in pushes.items():
+                            idx = 0 if attr == 'pinned' else 1
+                            if on_disk[idx] == pushed_value and value[idx] != pushed_value:
+                                attributed = True
+                                break
+            if not changed and not attributed:
+                snapshot[sid] = value
+                continue
+            try:
+                result = self._adopt_one(sid, *value)
+            except Exception:
+                logger.debug("flag-sync: adopt failed for %s", sid, exc_info=True)
+                result = False
+            if result == self._ADOPT_DEFERRED:
+                # Freshness guard refused to look at it -- do NOT consume the
+                # change. Holding the previous value here re-detects the same
+                # transition on the next pass; advancing the snapshot instead
+                # dropped the change permanently (found live 2026-10-11: a Desktop
+                # flip landing within the 10s settle window of a WebUI toggle was
+                # lost, leaving the two stores disagreeing until the next edit).
+                if sid in prev:
+                    snapshot[sid] = prev[sid]
+                continue
+            snapshot[sid] = value
+            if result:
+                adopted.append(sid)
+                if clear_pushes is not None:
+                    # Consumed: the sidecar now matches the db, so there is nothing
+                    # left to attribute.
+                    try:
+                        clear_pushes(sid)
+                    except Exception:
+                        pass
+        self._db_flag_snapshot = snapshot
+        if adopted:
+            logger.info("flag-sync: %s adopted %d flag(s) changed outside the WebUI: %s",
+                        "boot sweep" if boot_sweep else "transition",
+                        len(adopted), ", ".join(adopted[:5]))
+        return adopted
+
+    def _adopt_one(self, session_id: str, pinned: bool, archived: bool) -> bool | str:
+        """Write one externally-changed flag pair into its sidecar, if one exists."""
+        try:
+            from api.config import SESSION_DIR, _get_session_agent_lock
+            from api.models import get_session
+            from api.session_events import publish_session_list_changed
+        except Exception:
+            return False
+        sidecar = Path(SESSION_DIR) / f"{session_id}.json"
+        if not sidecar.exists():
+            # Projection rows (telegram/cli/cron) read these flags straight out of
+            # state.db, so they already agree. Materializing a sidecar here would
+            # create store entries the WebUI never asked for.
+            return False
+        # Cheap pre-check on the sidecar JSON itself: the boot sweep walks every
+        # row, and loading a Session (messages and all) just to discard it would be
+        # the expensive part of that sweep.
+        try:
+            on_disk = json.loads(sidecar.read_text())
+            if (bool(on_disk.get('pinned')) == pinned
+                    and bool(on_disk.get('archived')) == archived):
+                return False
+        except Exception:
+            return False
+        try:
+            if time.time() - sidecar.stat().st_mtime < self.SIDECAR_SETTLE_SECS:
+                # Written moments ago: patch #18 writes state.db right after the
+                # sidecar, so this may be our own in-flight toggle, not theirs.
+                return self._ADOPT_DEFERRED
+        except OSError:
+            return False
+        try:
+            session = get_session(session_id)
+        except Exception:
+            return False
+        if session is None:
+            return False
+        try:
+            with _get_session_agent_lock(session_id):
+                fresh = self._read_db_flags_for(session_id)
+                if fresh is None:
+                    return False
+                pinned, archived = fresh
+                if (bool(getattr(session, 'pinned', False)) == pinned
+                        and bool(getattr(session, 'archived', False)) == archived):
+                    return False
+                session.pinned = pinned
+                session.archived = archived
+                session.save(touch_updated_at=False)
+        except Exception:
+            logger.warning("flag-sync: sidecar write failed for %s", session_id, exc_info=True)
+            return False
+        try:
+            publish_session_list_changed("session_flag_sync", session_id=session_id)
+        except Exception:
+            logger.debug("flag-sync: publish failed for %s", session_id, exc_info=True)
+        return True
+
+    # ── Local patch 2026-10-11 (#20): inbound title sync (Desktop -> WebUI) ──
+    #
+    # Same shape as #19, one column family over. state.db's title is what the
+    # Desktop and `hermes sessions list` display; the WebUI displays its sidecar
+    # title. Renaming in either place used to move only one of them, so the two
+    # surfaces listed the same conversation under two different names.
+    def _read_db_titles(self) -> dict | None:
+        """``{session_id: (title, title_source)}`` for every listable state.db row."""
+        db_path = self._state_db_path
+        if not db_path.exists():
+            return None
+        try:
+            with closing(open_state_db_readonly(db_path)) as conn:
+                cols = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+                if not {'id', 'title', 'title_source'} <= cols:
+                    return None
+                rows = conn.execute(
+                    "SELECT id, title, title_source FROM sessions "
+                    "WHERE source IS NOT NULL AND source != 'subagent'").fetchall()
+            return {str(r[0]): (r[1], r[2]) for r in rows}
+        except Exception:
+            logger.debug("flag-sync: state.db title read failed", exc_info=True)
+            return None
+
+    def _read_db_title_for(self, session_id: str) -> tuple | None:
+        db_path = self._state_db_path
+        if not db_path.exists():
+            return None
+        try:
+            with closing(open_state_db_readonly(db_path)) as conn:
+                row = conn.execute(
+                    "SELECT title, title_source FROM sessions WHERE id = ?",
+                    (session_id,)).fetchone()
+            return (row[0], row[1]) if row else None
+        except Exception:
+            return None
+
+    def _adopt_titles(self) -> list:
+        """Adopt a HUMAN title set outside the WebUI into the sidecar.
+
+        Only ``title_source='user'`` rows qualify. An automatic title in state.db
+        must never overwrite what the WebUI is showing: the WebUI titles its own
+        sessions (patch #20's outbound half pushes that down), so letting an ``llm``
+        title flow back would make the two surfaces trade names forever. A user
+        title, by contrast, only ever comes from a person renaming something --
+        Hermes Desktop's rename dialog writes exactly that.
+        """
+        titles = self._read_db_titles()
+        if titles is None:
+            return []
+        prev = self._db_title_snapshot
+        boot_sweep = not prev
+        snapshot: dict[str, tuple] = {}
+        adopted = []
+        for sid, (title, source) in titles.items():
+            if source != 'user' or not title:
+                snapshot[sid] = (title, source)
+                continue
+            if not boot_sweep and prev.get(sid) == (title, source):
+                snapshot[sid] = (title, source)
+                continue
+            try:
+                result = self._adopt_title_one(sid, title)
+            except Exception:
+                logger.debug("flag-sync: title adopt failed for %s", sid, exc_info=True)
+                result = False
+            if result == self._ADOPT_DEFERRED:
+                # Same rule as the flag pass: a change the freshness guard skipped
+                # must stay unconsumed so the next pass retries it.
+                if sid in prev:
+                    snapshot[sid] = prev[sid]
+                continue
+            snapshot[sid] = (title, source)
+            if result:
+                adopted.append(sid)
+        self._db_title_snapshot = snapshot
+        if adopted:
+            logger.info("flag-sync: %s adopted %d renamed session(s): %s",
+                        "boot sweep" if boot_sweep else "transition",
+                        len(adopted), ", ".join(adopted[:5]))
+        return adopted
+
+    def _adopt_title_one(self, session_id: str, title: str) -> bool | str:
+        try:
+            from api.config import SESSION_DIR, _get_session_agent_lock
+            from api.models import get_session
+            from api.session_events import publish_session_list_changed
+        except Exception:
+            return False
+        sidecar = Path(SESSION_DIR) / f"{session_id}.json"
+        if not sidecar.exists():
+            return False
+        try:
+            on_disk = json.loads(sidecar.read_text())
+        except Exception:
+            return False
+        if str(on_disk.get('title') or '').strip() == str(title).strip():
+            return False
+        try:
+            if time.time() - sidecar.stat().st_mtime < self.SIDECAR_SETTLE_SECS:
+                return False
+        except OSError:
+            return False
+        try:
+            session = get_session(session_id)
+        except Exception:
+            return False
+        if session is None:
+            return False
+        try:
+            with _get_session_agent_lock(session_id):
+                fresh = self._read_db_title_for(session_id)
+                if not fresh or fresh[1] != 'user':
+                    return False
+                title = str(fresh[0] or '').strip()
+                if not title or str(getattr(session, 'title', '') or '').strip() == title:
+                    return False
+                session.title = title
+                # It IS a human title now, so protect it from the WebUI's own
+                # adaptive re-titling the way a WebUI rename would.
+                session.manual_title = True
+                session.llm_title_generated = False
+                session.save(touch_updated_at=False)
+        except Exception:
+            logger.warning("flag-sync: sidecar title write failed for %s", session_id, exc_info=True)
+            return False
+        try:
+            publish_session_list_changed("session_title_sync", session_id=session_id)
+        except Exception:
+            logger.debug("flag-sync: title publish failed for %s", session_id, exc_info=True)
+        return True
+
     def _poll_loop(self):
         """Main polling loop. Runs in a daemon thread.
 
@@ -427,6 +773,18 @@ class GatewayWatcher:
                 self._poll_once()
             except Exception:
                 logger.debug("Error in gateway watcher poll loop", exc_info=True)
+            # Local patch 2026-10-11 (#19): inbound flag sync runs every tick, NOT
+            # behind the fingerprint gate -- the gate excludes source='webui' rows
+            # precisely because their content churn is not what it watches.
+            try:
+                self._adopt_db_flags()
+            except Exception:
+                logger.debug("Error in flag-sync pass", exc_info=True)
+            # Local patch 2026-10-11 (#20): inbound title sync, same reasoning.
+            try:
+                self._adopt_titles()
+            except Exception:
+                logger.debug("Error in title-sync pass", exc_info=True)
 
             self._stop_event.wait(self.POLL_INTERVAL)
 

@@ -8817,24 +8817,43 @@ def import_cli_session(
     created_at=None,
     updated_at=None,
     parent_session_id=None,
+    model_provider=None,
 ):
     """Create a new WebUI session populated with CLI/agent messages.
 
     Preserve parent_session_id from state.db so imported continuation segments
     keep their lineage in the WebUI store and sidebar instead of reappearing as
     detached orphan chats.
+
+    ``model_provider`` (local patch 2026-09-14, provider-bleed) carries the
+    provider the agent ACTUALLY used, read from state.db by the caller. Without
+    it the imported sidecar has ``model_provider=None`` and the first WebUI write
+    resolves the model against the profile default provider — a Telegram session
+    switched to a cloud model then silently ran the local model while still
+    labelled with the cloud model name.
     """
     s = Session(
         session_id=session_id,
         title=title,
         workspace=get_last_workspace(profile=profile),
         model=model,
+        model_provider=model_provider,
         messages=messages,
         profile=profile,
         created_at=created_at,
         updated_at=updated_at,
         parent_session_id=parent_session_id,
     )
+    # Local patch 2026-09-14 (provider-bleed): an imported session's model was
+    # deliberately chosen outside the WebUI, so record it as an explicit pick.
+    # The streaming resolver only preserves a persisted cross-provider selection
+    # when the current routing context reproduces this signature; without it a
+    # cloud pick is "repaired" back to the profile default mid-session
+    # (upstream #5979/#6703) and the session silently drops to the local model.
+    if s.model_provider:
+        s.model_explicit_pick_signature = model_explicit_pick_signature(
+            s.model, s.model_provider
+        )
     # #4985: import_cli_session uses an explicit sid (the CLI sidecar's id).
     # If that sid was previously tombstoned as a webui zero-message orphan,
     # clear the tombstone entry so the freshly-imported session is visible
@@ -10552,7 +10571,10 @@ def _load_cli_sessions_uncached(
         if _sidecar_meta.get('archived') is not None:
             _archived = bool(_sidecar_meta['archived'])
         else:
-            _archived = bool(row.get('archived'))
+            # Local patch 2026-09-06: honor state.db's own archived/hidden flag.
+            # `hermes sessions archive` writes the state.db column; the hidden
+            # column marks rows the agent hides (subagent/CLI projections).
+            _archived = bool(row.get('archived')) or bool((row.get('hidden') or 0) == 1)
         _display_title = _title or f'{_source.title()} Session'
         cli_sessions.append({
             'session_id': sid,

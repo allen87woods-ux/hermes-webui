@@ -3023,6 +3023,23 @@ def _build_session_list_cache_payload(
     visible_scoped_filtered = _filter_sidebar_source(visible_scoped)
     archived_scoped_filtered = _filter_sidebar_source(archived_scoped)
     scoped = _filter_sidebar_source(full_scoped_all_sources)
+    if not include_archived:
+        # Local patch #21 (2026-10-11): a PIN survives archiving, exactly as it does
+        # on the Desktop (hermes_cli's listing calls list_sessions_rich with
+        # include_pinned=True). This payload used to carry active rows only, and the
+        # client-side pinned filter additionally demanded "not archived", so a
+        # session pinned in Hermes Desktop while archived had NO surface in the
+        # sidebar at all -- first case: 4 pins on the Desktop, 2 visible here, and
+        # the missing ones looked like a sync failure (they had in fact synced).
+        # Appended to `scoped` rather than merged into visible_scoped so the session
+        # counts and the on-demand archived page stay exactly as they were; the
+        # client renders pins as their own group, so nothing is listed twice.
+        _pinned_archived_rows = [
+            s for s in archived_scoped_filtered
+            if s.get("pinned") and s.get("archived")
+        ]
+        if _pinned_archived_rows:
+            scoped = scoped + _pinned_archived_rows
     if include_archived and archived_limit is not None:
         try:
             normalized_archived_limit = max(0, int(archived_limit))
@@ -6351,6 +6368,7 @@ def _get_or_materialize_session(sid: str, *, refresh_cli_messages: bool = False)
             title=cli_meta.get("title") or title_from(get_cli_session_messages(sid), "CLI Session"),
             workspace=get_last_workspace(),
             model=cli_meta.get("model") or "unknown",
+            model_provider=cli_meta.get("model_provider"),
             created_at=cli_meta.get("created_at"),
             updated_at=cli_meta.get("updated_at"),
         )
@@ -6369,6 +6387,7 @@ def _get_or_materialize_session(sid: str, *, refresh_cli_messages: bool = False)
             profile=cli_meta.get("profile"),
             created_at=cli_meta.get("created_at"),
             updated_at=cli_meta.get("updated_at"),
+            model_provider=cli_meta.get("model_provider"),
         )
         _apply_source_meta(s)
 
@@ -9536,13 +9555,100 @@ def _lookup_gateway_session_identity(session_id: str) -> dict:
     return metadata if isinstance(metadata, dict) else {}
 
 
+def _model_provider_from_model_config(model_config) -> str:
+    """Extract the provider from a state.db ``model_config`` JSON blob.
+
+    # Local patch 2026-09-14 (provider-bleed). The gateway writes the routing it
+    used into ``sessions.model_config`` (``provider`` at the top level, and again
+    under ``gateway_runtime``); ``billing_provider`` is the cheaper fallback.
+    """
+    raw = model_config
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            raw = raw.decode("utf-8", "replace")
+        except Exception:
+            return ""
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            return ""
+    if not isinstance(raw, dict):
+        return ""
+    runtime = raw.get("gateway_runtime")
+    runtime_provider = runtime.get("provider") if isinstance(runtime, dict) else None
+    for candidate in (raw.get("provider"), runtime_provider):
+        text = str(candidate or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _state_db_session_model_provider(sid: str) -> str:
+    """Return the provider the AGENT actually used for ``sid`` (state.db).
+
+    # Local patch 2026-09-14 (provider-bleed). Imported agent sessions
+    (telegram / cli / cron / other profiles) carry their routing in state.db,
+    never in the WebUI sidecar. Without it the sidecar is created with
+    ``model_provider=None`` and the first write resolves the model against the
+    PROFILE default provider instead of the session's own — a session switched to
+    a cloud model on Telegram then silently runs the LOCAL model while still
+    labelled with the cloud model name (llama-server serves any model name).
+    Returns "" on any error / missing row so callers keep existing behaviour.
+    """
+    if not sid or not is_safe_session_id(sid):
+        return ""
+    try:
+        from api.models import _active_state_db_path
+
+        db_path = _active_state_db_path()
+        if not db_path or not Path(db_path).exists():
+            return ""
+        import sqlite3 as _sqlite
+
+        with closing(_sqlite.connect(str(db_path))) as _conn:
+            row = _conn.execute(
+                "SELECT model_config, billing_provider FROM sessions WHERE id = ?",
+                (sid,),
+            ).fetchone()
+    except Exception:
+        return ""
+    if not row:
+        return ""
+    for candidate in (_model_provider_from_model_config(row[0]), row[1]):
+        provider = _clean_session_model_provider(candidate)
+        if provider:
+            return provider
+    return ""
+
+
+def _with_state_db_model_provider(row):
+    """Backfill ``model_provider`` on an imported agent-session metadata row.
+
+    # Local patch 2026-09-14 (provider-bleed). The state.db projection carries
+    ``model`` but no provider, so every import path (messaging stub, full
+    transcript import, read-only recovery) built a sidecar with
+    ``model_provider=None`` and the first write pinned the profile default.
+    """
+    if not isinstance(row, dict):
+        return row
+    if _clean_session_model_provider(row.get("model_provider")):
+        return row
+    provider = _state_db_session_model_provider(row.get("session_id"))
+    if not provider:
+        return row
+    enriched = dict(row)
+    enriched["model_provider"] = provider
+    return enriched
+
+
 def _lookup_cli_session_metadata(session_id: str, *, all_profiles: bool = False) -> dict:
     if not session_id:
         return {}
     try:
         for row in get_cli_sessions(all_profiles=all_profiles):
             if row.get("session_id") == session_id:
-                return row
+                return _with_state_db_model_provider(row)
     except Exception:
         return {}
     return {}
@@ -16118,6 +16224,10 @@ def handle_get(handler, parsed) -> bool:
         return True
 
     # ── Insights / knowledge status ──
+    if parsed.path == "/api/tasks/projects":
+        from api.projects_tasks import handle_projects_tasks_get
+
+        return handle_projects_tasks_get(handler, parsed)
     if parsed.path == "/api/insights":
         return _handle_insights(handler, parsed)
     if parsed.path == "/api/project-os/dashboard":
@@ -17673,6 +17783,10 @@ def handle_post(handler, parsed) -> bool:
         result = repair_safe_session_recovery(SESSION_DIR, state_db_path=_active_state_db_path())
         return j(handler, result, status=200 if result.get("clean") else 409)
 
+    if parsed.path == "/api/tasks/projects":
+        from api.projects_tasks import handle_projects_tasks_post
+
+        return handle_projects_tasks_post(handler, parsed, body)
     if parsed.path.startswith("/api/kanban/"):
         from api.kanban_bridge import handle_kanban_post
 
@@ -18247,6 +18361,21 @@ def handle_post(handler, parsed) -> bool:
                 SESSIONS[sid] = s
                 SESSIONS.move_to_end(sid)
                 _evict_sessions_over_cap()  # #4765: safe LRU eviction (never active/unsaved)
+        # Local patch #20 (2026-10-11): mirror the rename into state.db under user
+        # authority. Without this the sidecar carried the new name while state.db
+        # kept the old auto-title, so Hermes Desktop and `hermes sessions list`
+        # listed the conversation under a different name (live case: a session
+        # renamed "Pyrowave" appeared in the Desktop as "Household high speed
+        # internet benefits", which reads as "the session is missing").
+        try:
+            from api.state_sync import sync_session_title_manual
+            sync_session_title_manual(
+                getattr(s, "session_id", body["session_id"]),
+                getattr(s, "title", body["title"]),
+                profile=getattr(s, "profile", None) or "default",
+            )
+        except Exception:
+            pass
         _sync_session_title_to_insights(s)
         publish_session_list_changed(
             "session_rename",
@@ -18375,14 +18504,34 @@ def handle_post(handler, parsed) -> bool:
         def _draft_mark(name):
             _draft_stages.append((name, _draft_time.monotonic()))
         _draft_mark("enter")
+
+        # Transient resolve retry (2026-10-10): a 10:00 EDT burst showed 34
+        # draft autosaves 404-ing in 33s while the session file existed on
+        # disk. A full sidecar load can be mid-flight under the single-flight
+        # slot budget, so a brief retry recovers what would otherwise be a
+        # silently dropped in-progress draft. Log the sid on final failure
+        # (the access log does not carry POST bodies).
+        def _resolve_for_draft(_sid):
+            _tries = 3
+            for _i in range(_tries):
+                try:
+                    return get_session(_sid)
+                except KeyError:
+                    if _i == _tries - 1:
+                        logger.warning(
+                            "[draft] session %s unresolvable after %d tries; autosave dropped",
+                            _sid, _tries,
+                        )
+                    else:
+                        _draft_time.sleep(0.25 * (_i + 1))
+            return None
         if handler.command == "GET":
             query = parse_qs(parsed.query)
             sid = query.get("session_id", [""])[0] if parsed.query else ""
             if not sid:
                 return bad(handler, "session_id is required", 400)
-            try:
-                s = get_session(sid)
-            except KeyError:
+            s = _resolve_for_draft(sid)
+            if s is None:
                 return bad(handler, "Session not found", 404)
             draft = getattr(s, "composer_draft", {}) or {}
             return j(handler, {"draft": draft})
@@ -18410,9 +18559,8 @@ def handle_post(handler, parsed) -> bool:
             files = []
         if isinstance(files, list) and len(files) > _MAX_DRAFT_FILES:
             files = files[:_MAX_DRAFT_FILES]
-        try:
-            s = get_session(sid)
-        except KeyError:
+        s = _resolve_for_draft(sid)
+        if s is None:
             return bad(handler, "Session not found", 404)
         _draft_mark("after_get_session")
         unchanged = False
@@ -19887,6 +20035,17 @@ def handle_post(handler, parsed) -> bool:
             with _get_session_agent_lock(body["session_id"]):
                 s.pinned = pin_requested
                 s.save()
+        # Mirror the toggle into state.db so the Desktop app / serve backend
+        # (which reads pin state from there) shows the same pinned set.
+        try:
+            from api.state_sync import sync_session_flags
+            sync_session_flags(
+                getattr(s, "session_id", body["session_id"]),
+                pinned=bool(getattr(s, "pinned", pin_requested)),
+                profile=getattr(s, "profile", None),
+            )
+        except Exception:
+            pass
         publish_session_list_changed(
             "session_pin",
             profile=getattr(s, "profile", None),
@@ -19941,6 +20100,7 @@ def handle_post(handler, parsed) -> bool:
                     workspace=get_last_workspace(profile=_arch_profile),
                     messages=[],
                     model=cli_meta.get("model") or "unknown",
+                    model_provider=cli_meta.get("model_provider"),
                     created_at=cli_meta.get("created_at"),
                     updated_at=cli_meta.get("updated_at"),
                     profile=_arch_profile,
@@ -19969,6 +20129,7 @@ def handle_post(handler, parsed) -> bool:
                     profile=cli_meta.get("profile"),
                     created_at=cli_meta.get("created_at"),
                     updated_at=cli_meta.get("updated_at"),
+                    model_provider=cli_meta.get("model_provider"),
                 )
                 s.is_cli_session = is_cli_session_row(cli_meta)
                 s.source_tag = cli_meta.get("source_tag")
@@ -20016,6 +20177,17 @@ def handle_post(handler, parsed) -> bool:
                 SESSIONS[sid] = s
                 SESSIONS.move_to_end(sid)
                 _evict_sessions_over_cap()  # #4765: safe LRU eviction (never active/unsaved)
+        # Mirror the toggle into state.db so the Desktop app / serve backend
+        # (which reads archive state from there) hides and shows the same set.
+        try:
+            from api.state_sync import sync_session_flags
+            sync_session_flags(
+                sid,
+                archived=bool(getattr(s, "archived", True)),
+                profile=getattr(s, "profile", None),
+            )
+        except Exception:
+            pass
         publish_session_list_changed(
             "session_archive",
             profile=getattr(s, "profile", None),
@@ -20913,6 +21085,10 @@ def handle_patch(handler, parsed) -> bool:
         # original-case path, not the folded matching path.
         name = _original_api_path(handler, parsed)[len("/api/mcp/servers/"):]
         return _handle_mcp_server_toggle(handler, name, body)
+    if parsed.path == "/api/tasks/projects":
+        from api.projects_tasks import handle_projects_tasks_patch
+
+        return handle_projects_tasks_patch(handler, parsed, body)
     if parsed.path.startswith("/api/kanban/"):
         from api.kanban_bridge import handle_kanban_patch
 
@@ -24599,6 +24775,15 @@ def _handle_session_sse_stream(handler, parsed):
     if not sid:
         return bad(handler, "session_id is required")
 
+    # TSK-136: hermes-android detection — the native background service sends
+    # a Dalvik/* UA (plain HttpURLConnection) and the in-app webview appends
+    # "Hermes-Android/<ver>" to its Chrome UA. Only phone subscribers may
+    # claim pending push events; browser tabs have no handler for them.
+    try:
+        _ua_ts136 = (getattr(handler, "headers", None) or {}).get("User-Agent", "") or ""
+    except Exception:
+        _ua_ts136 = ""
+
     # The (re)subscribing tab reports its last-known message_count via
     # ?known_count=N so the on-subscribe self-heal can detect a server-initiated
     # turn that started AND finished entirely inside this tab's SSE gap (see the
@@ -24615,7 +24800,11 @@ def _handle_session_sse_stream(handler, parsed):
         active_stream_id_for_session,
         persisted_message_count_for_session,
         should_emit_session_updated,
+        pending_push_take_for,
+        is_phone_ua,
     )
+
+    _is_phone_ts136 = is_phone_ua(_ua_ts136)
 
     # Atomic get-or-create + subscribe under SESSION_CHANNELS_LOCK. Doing these
     # two steps separately (get_or_create_session_channel then ch.subscribe)
@@ -24625,7 +24814,7 @@ def _handle_session_sse_stream(handler, parsed):
     # orphaning this subscriber on a channel no longer in SESSION_CHANNELS.
     # bg_task_complete emits would then never reach this queue. See
     # subscribe_to_session_channel for the full rationale (PR #2971 Greptile P1).
-    ch, q = subscribe_to_session_channel(sid, maxsize=64)
+    ch, q = subscribe_to_session_channel(sid, maxsize=64, phone=_is_phone_ts136)
 
     # NOTE: ``subscribe_to_session_channel`` above acquires a subscriber slot
     # that MUST be released on every exit path. Header setup
@@ -24728,6 +24917,20 @@ def _handle_session_sse_stream(handler, parsed):
                             "known_count": subscriber_known_count,
                             "source": "subscribe_recovery",
                         })
+            # ── TSK-135: replay pending broadcast events (offline buffer) ──
+            # turn_completed / approval_required broadcasts that reached ZERO
+            # live subscribers at emit time (stream gap, webui restart, app
+            # suspension) used to be lost forever — the phone's native
+            # background service never fired the missed notification. The
+            # file-backed pending store (background_process.pending_push_*)
+            # holds them; replay to this (re)connecting client here so the
+            # notification lands on the next reconnect. Events are claimed
+            # per-session in the store, so no later subscriber gets a second
+            # copy. `recovered: true` marks the frame as a replay.
+            for _replay_event, _replay_data in pending_push_take_for(
+                sid, phone=_is_phone_ts136
+            ):
+                _sse(handler, _replay_event, _replay_data)
         except _CLIENT_DISCONNECT_ERRORS:
             # Client vanished mid-recovery — re-raise so the outer handler
             # treats it as a normal disconnect and the finally still cleans up.
@@ -24748,6 +24951,16 @@ def _handle_session_sse_stream(handler, parsed):
                 # quiet-but-healthy tab from a half-open socket on an idle session,
                 # because an idle session never fills a subscriber's queue.
                 ch.note_subscriber_write_ok(q)
+                # TSK-135: also emit a real `ping` event every heartbeat. The
+                # comment keepalive above carries BYTES but no SSE event; if a
+                # client's EventSource reader idles on *events* rather than
+                # bytes, the 5s comment-only gap looks like a dead stream
+                # (~5-6s churn loop observed in the hermes-android background
+                # service with known_count frozen). A real event frame keeps
+                # that path alive. `ping` is unknown to the in-app UI and to
+                # the browser frontend (no listeners) - ignored by design,
+                # same convention as TSK-134's broadcast event names.
+                _sse(handler, 'ping', {"session_id": sid})
                 continue
             if payload is None:
                 # End-of-stream sentinel: the channel was deliberately closed
@@ -32001,6 +32214,20 @@ def _handle_session_compress(handler, body):
         resolved_api_key = _bundle["api_key"]
         resolved_base_url = _bundle["base_url"]
 
+        # Keyless local OpenAI-compatible servers (llama.cpp on
+        # 127.0.0.1:8080) run without authentication. The chat path
+        # (api.streaming._resolve_custom_provider_runtime_overrides) already
+        # allows these: it rewrites custom:<slug> -> custom and supplies a
+        # placeholder key. Mirror that here so manual compression of a
+        # keyless local-model session does not 400 with "No provider
+        # configured" while the same session's chat works fine.
+        if not resolved_api_key and resolved_base_url:
+            if isinstance(resolved_provider, str) and resolved_provider.startswith("custom:"):
+                resolved_provider = "custom"
+            from api.streaming import _KEYLESS_CUSTOM_API_KEY
+
+            resolved_api_key = _KEYLESS_CUSTOM_API_KEY
+
         if not resolved_api_key:
             return bad(handler, "No provider configured -- cannot compress.")
 
@@ -33322,6 +33549,7 @@ def _handle_session_import_cli(handler, body):
         created_at=created_at,
         updated_at=updated_at,
         parent_session_id=cli_parent_session_id,
+        model_provider=(cli_meta or {}).get("model_provider"),
     )
     if cron_project_id:
         s.project_id = cron_project_id

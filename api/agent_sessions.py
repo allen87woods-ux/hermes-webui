@@ -794,6 +794,7 @@ def read_importable_agent_session_rows(
             return _result([])
 
         parent_expr = _optional_col('parent_session_id', session_cols)
+        archived_expr = _optional_col('archived', session_cols)
         session_source_expr = _optional_col('session_source', session_cols)
         model_config_expr = _optional_col('model_config', session_cols)
         ended_expr = _optional_col('ended_at', session_cols)
@@ -989,6 +990,7 @@ def read_importable_agent_session_rows(
         select_sql = f"""
             SELECT s.id, s.title, s.model, s.message_count,
                    s.started_at, s.source,
+                   {archived_expr},
                    {session_source_expr},
                    {model_config_expr},
                    {user_id_expr},

@@ -6611,6 +6611,16 @@ def set_hermes_default_model(model_id: str, provider: str | None = None, advance
         # so the agent's auxiliary client uses the ``no-key-required`` path.
         if persisted_provider.lower() == "local":
             persisted_provider = "custom"
+        # Never persist a WebUI ``custom:<slug>`` catalog ID as the top-level
+        # provider. The hermes-agent CLI/gateway resolves ``model.provider``
+        # against its provider registry, which knows bare ``custom`` (paired with
+        # ``model.base_url``) — NOT the slug form the WebUI catalog uses to tell
+        # multiple custom providers apart. Writing the slug broke the gateway
+        # with "Unknown provider 'custom:<slug>'" (local-model outage 2026-08-22).
+        # Collapse to bare ``custom``; the endpoint is carried in
+        # ``model.base_url``, which the block below sets from resolved_base_url.
+        if isinstance(persisted_provider, str) and persisted_provider.startswith("custom:"):
+            persisted_provider = "custom"
 
         model_cfg["default"] = persisted_model
         if persisted_provider:

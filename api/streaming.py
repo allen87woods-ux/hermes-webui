@@ -3376,6 +3376,12 @@ def _merge_process_wakeup_pause_into_current_session(
     return recorded
 
 
+# Local patch 2026-08-28 (cancel-notify): stream_ids that already emitted a
+# cancel turn_completed broadcast (5-min TTL via threading.Timer). Prevents
+# duplicate phone notifications if a finalize path re-enters for one stream.
+_CANCEL_NOTIFY_EMITTED: set = set()
+
+
 def _finalize_cancelled_turn(
     session,
     *,
@@ -3451,6 +3457,39 @@ def _finalize_cancelled_turn(
         session.save()
     except Exception:
         logger.debug("Failed to persist cancelled turn", exc_info=True)
+    # Local patch 2026-08-28 (cancel-notify): broadcast a turn_completed frame
+    # for CANCELLED persistent turns too. Before this, only the normal-completion
+    # path (streaming.py ~11977) and route_approvals broadcast turn_completed; a
+    # user-cancel ended with a bare 'cancel' event, so the phone never got a
+    # notification when Allen hit Stop (08-28 DeepSeek loop: an 18-min run was
+    # cancelled and the phone saw nothing). The frontend handler (messages.js,
+    # TSK-136) and the android background service (ReconnectSessionStreamSupport)
+    # both render the summary as the notification body, so status='cancelled'
+    # surfaces as "Task cancelled." / the message passed here.
+    # Generation-safe: we only reach this point when the writeback-owner guard
+    # above confirms this stream still owns the session, so the frame refers to
+    # a real cancellation. Dedup via a per-stream stamp prevents double-fire if
+    # a finalize path re-enters for the same stream.
+    try:
+        if stream_id and stream_id not in _CANCEL_NOTIFY_EMITTED:
+            _sid = getattr(session, "session_id", None)
+            if _sid:
+                _CANCEL_NOTIFY_EMITTED.add(stream_id)
+                if len(_CANCEL_NOTIFY_EMITTED) > 1024:
+                    _CANCEL_NOTIFY_EMITTED.clear()
+                from api.background_process import broadcast_to_all_session_channels
+                broadcast_to_all_session_channels(
+                    "turn_completed",
+                    {"status": "cancelled", "summary": message,
+                     "session_id": _sid},
+                )
+    except Exception:
+        logger.debug("cancel turn_completed broadcast failed for stream %s",
+                     stream_id, exc_info=True)
+    threading.Timer(
+        300.0,
+        lambda: _CANCEL_NOTIFY_EMITTED.discard(stream_id) if stream_id else None,
+    ).start()
 
 
 def _aiagent_import_error_detail() -> str:
@@ -7220,7 +7259,11 @@ def _preserve_pre_compression_snapshot(
                 if continuation_sid
                 else None
             )
-            s.pinned = False
+            # Local patch 2026-08-27 (issue #3799): do NOT clear the pin on
+            # the archived snapshot — the pin survives on the archived row
+            # and the rotation block inherits it onto the live continuation.
+            # The pin quota counts VISIBLE lineages, so the archived copy
+            # adds no extra quota. (was: s.pinned = False)
             # Stage-359 / PR #2295: clear runtime stream-state fields on the
             # archived snapshot so the sidebar does not reopen the parent as
             # a permanently-running session while the child already holds the
@@ -7269,7 +7312,9 @@ def _preserve_pre_compression_snapshot(
                 if continuation_sid
                 else None
             )
-            snapshot.pinned = False
+            # Local patch 2026-08-27 (issue #3799): keep the pin on the
+            # archived snapshot (see full-save branch above); the rotation
+            # block inherits it onto the continuation. (was: pinned=False)
             # Stage-359 Opus SHOULD-FIX: clear runtime fields on the loaded
             # snapshot too. If the disk snapshot was last persisted while the
             # parent was live, it could carry a stale active_stream_id /
@@ -16296,10 +16341,30 @@ def _run_agent_streaming(
                             "Stamped profile=%r on continuation session %s after compression",
                             _resolved_profile_name, new_sid,
                         )
+                    # Local patch 2026-08-27 (issue #3799): capture the archived
+                    # row's pin from disk BEFORE the ownership migration rewrites
+                    # the snapshot, so a user pin survives rotation onto the live
+                    # continuation.
+                    _pin_inherited_from_old = False
+                    try:
+                        _old_pin_text = (SESSION_DIR / f'{old_sid}.json').read_text(encoding='utf-8')
+                        _pin_inherited_from_old = bool(json.loads(_old_pin_text).get('pinned', False))
+                    except (OSError, ValueError):
+                        _pin_inherited_from_old = bool(getattr(s, 'pinned', False))
                     if not _migrate_compression_session_ownership(s, old_sid, new_sid, _agent_lock):
                         s.profile = _pre_migration_profile
                         raise RuntimeError(
                             f"Failed to migrate compressed-session ownership: {old_sid}->{new_sid}",
+                        )
+                    # Local patch 2026-08-27 (issue #3799): inherit the pin onto
+                    # the live continuation. The quota counts visible lineages, so
+                    # the continuation consumes the same single slot the archived
+                    # snapshot held.
+                    if _pin_inherited_from_old and not s.pinned:
+                        s.pinned = True
+                        logger.info(
+                            "Inherited pinned=true from archived snapshot %s onto continuation %s",
+                            old_sid, new_sid,
                         )
                     # Migrate cached agent to the new session ID so the turn
                     # count survives context compression.
@@ -17353,6 +17418,57 @@ def _run_agent_streaming(
                         mark_turn_completed(s.session_id, agent=agent)
                     except Exception:
                         logger.debug("Memory lifecycle mark failed for session %s", s.session_id, exc_info=True)
+                if not ephemeral:
+                    # ── TSK-130: fan out interactive turn completion to the persistent
+                    # session channel so the hermes-android native background service
+                    # can post a "finished" notification while the app is backgrounded
+                    # or closed. Interactive completion is not broadcast anywhere else.
+                    # ──
+                    try:
+                        from api.background_process import _emit_to_session_streams
+                        _last_asst = next(
+                            (m for m in reversed(s.messages)
+                             if isinstance(m, dict) and m.get('role') == 'assistant'),
+                            None,
+                        )
+                        _summary = ''
+                        if _last_asst is not None:
+                            _content = _last_asst.get('content')
+                            if isinstance(_content, str):
+                                _summary = _content
+                            elif isinstance(_content, list):
+                                _summary = ' '.join(
+                                    str(p.get('text', '')) for p in _content
+                                    if isinstance(p, dict) and p.get('type') == 'text'
+                                )
+                            _summary = ' '.join(_summary.split())[:200]
+                        _emitted = _emit_to_session_streams(
+                            s.session_id,
+                            "turn_completed",
+                            {"status": "ok", "summary": _summary,
+                             "session_id": s.session_id},
+                        )
+                        # TSK-134: ALSO broadcast to every live session channel.
+                        # The android background service streams only the session
+                        # loaded in the app; without this broadcast, completions
+                        # in any other session never produce a phone notification.
+                        # Event name 'turn_completed' is ignored by the in-app UI
+                        # (no frontend listener), so browser tabs are unaffected.
+                        try:
+                            from api.background_process import (
+                                broadcast_to_all_session_channels as _bc_turn_done,
+                            )
+                            _emitted += _bc_turn_done(
+                                "turn_completed",
+                                {"status": "ok", "summary": _summary,
+                                 "session_id": s.session_id},
+                            )
+                        except Exception:
+                            logger.debug("turn_completed broadcast failed for session %s", s.session_id, exc_info=True)
+                        if _emitted:
+                            logger.debug("turn_completed fanned out for session %s (%d subscribers)", s.session_id, _emitted)
+                    except Exception:
+                        logger.debug("turn_completed fan-out failed for session %s", s.session_id, exc_info=True)
                 with _stream_writeback_stage(_writeback_timings, "persistent_state_scan"):
                     try:
                         _persistent_changes = _persistent_state_changes(

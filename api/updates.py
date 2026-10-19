@@ -2048,8 +2048,16 @@ def _purge_agent_pycache(repo_dir: Path) -> None:
         pass
 
 
-def _schedule_restart(delay: float = 2.0) -> None:
+def _schedule_restart(
+    delay: float = 2.0,
+    max_wait_seconds: float | None = 300.0,
+) -> None:
     """Re-exec this process after *delay* seconds.
+
+    ``max_wait_seconds`` bounds the wait for in-flight chat work to clear.
+    ``None`` waits indefinitely, which is the correct choice for a restart
+    nobody is blocked on (no waiting user, no deadline) so an in-flight turn is
+    never preempted.  The update path keeps its bounded default.
 
     Called after a successful update so that the freshly-pulled code is
     loaded on the next request, rather than running with a mix of old and
@@ -2083,7 +2091,11 @@ def _schedule_restart(delay: float = 2.0) -> None:
         # Threads die when execv replaces the process image, so the lock is
         # released atomically by the kernel.
         with _apply_lock:
-            _wait_until_restart_safe()
+            _wait_until_restart_safe(
+                max_wait_seconds=(
+                    float("inf") if max_wait_seconds is None else max_wait_seconds
+                )
+            )
             # Purge bytecode caches so the new process imports from
             # current source.  Without this, Python may serve stale .pyc
             # files whose mtime matches the just-pulled .py files,
@@ -2134,7 +2146,15 @@ def _schedule_restart(delay: float = 2.0) -> None:
                     else:
                         os.execv(sys.executable, [sys.executable] + sys.argv)
             except Exception:
-                # Last-resort: let the process supervisor restart us.
+                # Last-resort: log first, then let the supervisor restart us.
+                # Local patch 2026-09-18: an interactively-launched server has
+                # no supervisor to notice, and a silent exit looks like a crash.
+                logger.exception("self-restart: re-exec failed; exiting for supervisor")
+                print(
+                    "[!!] self-restart: re-exec failed; exiting so the supervisor "
+                    "restarts this process",
+                    flush=True,
+                )
                 _windows_restart_exit(0)
 
     threading.Thread(target=_do, daemon=True).start()

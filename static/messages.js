@@ -1396,6 +1396,30 @@ function _restoreComposerDraftAfterFailedSend(draftText, filesSnapshot, sid, cle
   return restoredVisible;
 }
 
+// Local patch 2026-09-18 (agent-revision guard): a stale agent revision makes
+// the server re-exec onto the new source automatically (in place, same PID), so
+// the first request can land in the ~4s window and get
+// `409 agent_runtime_stale`. Retry that ONE typed error a few times instead of
+// surfacing a dead end. Bounded on purpose: if the reload is queued behind a
+// long running turn, report honestly rather than hammering the server.
+async function _postChatStartRetryingStale(payload){
+  const delays=[1500,2500,4000,6000];
+  for(let attempt=0;;attempt++){
+    try{
+      return await api('/api/chat/start',{method:'POST',body:JSON.stringify(payload)});
+    }catch(err){
+      // The server's typed error field lives in the RAW body (api() attaches it
+      // as err.body); the human message alone does not carry the token.
+      const errMsg=String((err&&err.message)||'');
+      const errBody=String((err&&err.body)||'');
+      const stale=!!(err&&err.status===409
+        &&(/agent_runtime_stale/.test(errBody)||/agent_runtime_stale/.test(errMsg)));
+      if(!stale||attempt>=delays.length)throw err;
+      await new Promise(resolve=>setTimeout(resolve,delays[attempt]));
+    }
+  }
+}
+
 async function send(){
   // Static guards expect _defaultMessageMode to stay near send() while the actual
   // read remains in the S.busy branch below.
@@ -1860,7 +1884,7 @@ async function send(){
     // pick. (#3739/#3737, Codex catch)
     if(_pendingPickMatch && typeof _clearPendingSessionModel==='function') _clearPendingSessionModel(activeSid);
     explicitPickForPostStart=_explicitPick;
-    const startData=await api('/api/chat/start',{method:'POST',body:JSON.stringify({
+    const startData=await _postChatStartRetryingStale({
       session_id:activeSid,message:msgText,
       // S.session.model remains authoritative; the helper only resolves a
       // matching provider fallback for the same outgoing model.
@@ -1870,7 +1894,7 @@ async function send(){
       explicit_model_pick:_explicitPick||undefined,
       attachments:uploaded.length?uploaded:undefined,
       moa_config:_pendingMoaConfig?true:undefined
-    })});
+    });
     _pendingMoaConfig=null;
     postStartData = startData;
   }catch(e){
@@ -2043,9 +2067,9 @@ async function startRegeneration(sessionId, regenerationRevision){
   if(typeof ensureLiveWorklogShell==='function')ensureLiveWorklogShell();
   else if(typeof appendThinking==='function')appendThinking('',{pending:true});
   try{
-    const response=await api('/api/chat/start',{method:'POST',body:JSON.stringify({
+    const response=await _postChatStartRetryingStale({
       session_id:sid,regenerate:true,regeneration_revision:regenerationRevision
-    })});
+    });
     if(!S.session||S.session.session_id!==sid)return;
     const streamId=response&&response.stream_id;
     if(!streamId)throw new Error('Regeneration did not start a stream.');
@@ -8914,6 +8938,40 @@ function startSessionStream(sid) {
       if (typeof _handleBgTaskCompleteEvent === 'function') {
         _handleBgTaskCompleteEvent(e, sid, {source: 'session'});
       }
+    });
+    // ── TSK-136: completion push surfaced in the tab that owns the stream ──
+    // The server broadcasts `turn_completed` to every live session channel
+    // (TSK-134), so this persistent session stream receives completions for
+    // ANY session — not just the one on screen. In the hermes-android in-app
+    // webview, `new Notification()` is polyfilled by the native bridge into a
+    // REAL system notification (works on the lock screen, app backgrounded).
+    // Before TSK-136 the frontend had no `turn_completed` handler anywhere, so
+    // the event was silently dropped by every tab — the phone only got pings
+    // when the one-shot native background service happened to be alive
+    // (08-28 incident: 3 completions parked/replayed into webviews, zero
+    // notifications). Surface it here via the same browser-notification path
+    // the chat-stream `done` event uses (respects _notificationsEnabled, the
+    // backgrounded gate, and the Notification polyfill).
+    es.addEventListener('turn_completed', e => {
+      try {
+        const d = JSON.parse(e.data || '{}');
+        const evSid = d.session_id || sid;
+        // The session on screen already renders the finished turn live; only
+        // notify when this tab is NOT actively viewing the completed session
+        // (backgrounded, or the completion is for a different session — e.g.
+        // a server-side / cron / TG turn).
+        const isCurrent = (typeof _isSessionCurrentPane === 'function')
+          ? _isSessionCurrentPane(evSid)
+          : (S.session && S.session.session_id === evSid);
+        const _docHidden = (typeof document !== 'undefined') && (document.visibilityState === 'hidden' || document.hidden);
+        if (isCurrent && !_docHidden) return;
+        if (typeof _notificationsEnabled !== 'undefined' && !window._notificationsEnabled) return;
+        const _sum = String(d.summary || '').slice(0, 200);
+        const _title = 'Agatha finished' + (evSid !== sid ? ' — another session' : '');
+        if (typeof sendBrowserNotification === 'function') {
+          sendBrowserNotification(_title, _sum || 'Task finished', {forceHidden: true, sid: evSid});
+        }
+      } catch (_) {}
     });
     // ── Visible-tab self-heal: a server-initiated turn finished during an SSE
     // gap ─────────────────────────────────────────────────────────────────

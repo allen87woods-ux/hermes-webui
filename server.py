@@ -375,6 +375,14 @@ class Handler(BaseHTTPRequestHandler):
             'status': int(code) if str(code).isdigit() else code,
             'ms': duration_ms,
         }
+        # TSK-136: UA in the access log — distinguishes the native Android
+        # service (Dalvik/*) from webview/browser streams (Chrome UA).
+        try:
+            _ua_log = (self.headers.get('User-Agent') or '')[:160]
+            if _ua_log:
+                record_data['ua'] = _ua_log
+        except Exception:
+            pass
         if forwarded_for:
             record_data['forwarded_for'] = forwarded_for
         record = _json.dumps(record_data)
@@ -699,6 +707,29 @@ def main() -> None:
         print(f'  Remote access: ssh -N -L {PORT}:127.0.0.1:{PORT} <user>@<your-server>', flush=True)
     print(f'  Then open:     {scheme}://localhost:{PORT}', flush=True)
     print('', flush=True)
+
+    # Keep the long-lived process honest about which Agent source it loaded. A
+    # HEAD move in ~/.hermes/hermes-agent invalidates the in-process agent
+    # runtime; the fail-closed guard in api/agent_runtime.py detects that on use
+    # and arms an in-place re-exec (same PID, no systemd service restart, waits
+    # for in-flight work). One banner, no polling thread, no timer.
+    try:
+        from api.agent_runtime import loaded_agent_revision_banner
+        print(f'  agent runtime: {loaded_agent_revision_banner()}', flush=True)
+    except Exception as e:
+        print(f'[!!] WARNING: agent runtime banner failed: {e}', flush=True)
+
+    # Local patch 2026-09-24 (TSK-143 / webui patch #15): wire the config's
+    # shell hooks (hooks: block) into this process.  Without this the WebUI
+    # surface was the only one where the pre_tool_call risk guard was inert.
+    # Runs after verify_hermes_imports() above, so the agent dir is on
+    # sys.path; non-fatal by design (register_configured_shell_hooks
+    # swallows its own errors).
+    try:
+        from api.agent_runtime import register_configured_shell_hooks
+        register_configured_shell_hooks()
+    except Exception as e:
+        print(f'[!!] WARNING: shell-hook registration failed: {e}', flush=True)
 
     # ctl.sh stops the WebUI with SIGTERM. Python's default SIGTERM handler
     # terminates the process WITHOUT unwinding the try/finally around
