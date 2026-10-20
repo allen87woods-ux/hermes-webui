@@ -160,12 +160,14 @@ def normalize_agent_session_source(raw_source: str | None) -> dict:
 
     if raw == 'webui':
         session_source = 'webui'
-    elif raw in {'acp', 'cli', 'tui'}:
+    elif raw in {'acp', 'cli', 'tui', 'desktop'}:
         # 'acp' (Agent Client Protocol adapter — Zed, external device bridges)
         # is a local interactive agent client like the CLI/TUI: its sessions
         # live only in state.db, so classifying it 'other' would leave them
         # invisible in both sidebar buckets (webui skips the state.db
-        # projection; cli keeps only CLI-classified rows).
+        # projection; cli keeps only CLI-classified rows). 'desktop' (desktop
+        # client) is the same: a local interactive session that lives only in
+        # state.db.
         session_source = 'cli'
     elif raw in MESSAGING_SOURCES:
         session_source = 'messaging'
@@ -317,10 +319,10 @@ def is_cli_session_row(row: dict) -> bool:
     if source in {"external_agent", "external-agent"}:
         return True
     if (
-        source_tag in {"acp", "cli", "tui"}
-        or raw_source in {"acp", "cli", "tui"}
-        or source_name in {"acp", "cli", "tui"}
-        or source_label in {"acp", "cli", "tui"}
+        source_tag in {"acp", "cli", "tui", "desktop"}
+        or raw_source in {"acp", "cli", "tui", "desktop"}
+        or source_name in {"acp", "cli", "tui", "desktop"}
+        or source_label in {"acp", "cli", "tui", "desktop"}
     ):
         return True
 
