@@ -14900,6 +14900,20 @@ def _run_agent_streaming(
                 meter().record_reasoning(stream_id, _metering_reasoning_deltas[0])
                 _emit_metering()
 
+            def _client_hides_interim():
+                # Local patch (#25): Allen reads interim narration as "thinking"
+                # clutter in the phone transcript. Server-side gate so no client
+                # version can render it. Cached per stream: one settings read.
+                cached = getattr(_client_hides_interim, "_hide", None)
+                if cached is None:
+                    try:
+                        from api.config import load_settings as _ls
+                        cached = bool((_ls() or {}).get("hide_interim_messages"))
+                    except Exception:
+                        cached = False
+                    _client_hides_interim._hide = cached
+                return cached
+
             def on_interim_assistant(text, **cb_kwargs):
                 nonlocal _current_reasoning_idx
                 # Advance the per-message reasoning index unconditionally (#3587):
@@ -14920,6 +14934,8 @@ def _run_agent_streaming(
                     _unbound_reasoning_idx[0] = None
                 reasoning_echo = _strip_reasoning_output_echo(visible)
                 already_streamed = bool(cb_kwargs.get('already_streamed', False)) or _is_visible_output_echo(visible)
+                if _client_hides_interim():
+                    return
                 payload = {
                     'text': visible,
                     'already_streamed': already_streamed,

@@ -13330,6 +13330,7 @@ _SETTINGS_DEFAULTS = {
     "rtl": False,  # right-to-left chat layout (chat messages + composer only)
     "notifications_enabled": False,  # browser notification when tab is in background
     "show_thinking": True,  # show/hide thinking/reasoning blocks in chat view
+    "hide_interim_messages": False,  # local (#25): suppress mid-turn narration segments in the webui stream
     "simplified_tool_calling": True,  # legacy compatibility; Worklog renderer remains enabled
     "terminal_auto_expand_on_output": False,  # auto-expand terminal panel when output arrives while collapsed
     "workspace_todos_tab": False,  # show a Todos tab in the workspace panel (right side)
@@ -13645,6 +13646,7 @@ _SETTINGS_BOOL_KEYS = {
     "rtl",
     "notifications_enabled",
     "show_thinking",
+    "hide_interim_messages",
     "terminal_auto_expand_on_output",
     "workspace_todos_tab",
     "api_redact_enabled",
