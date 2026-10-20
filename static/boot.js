@@ -3993,6 +3993,7 @@ window._mirrorSpeechSettingsFromServer=_mirrorSpeechSettingsFromServer;
     window._notificationsEnabled=!!s.notifications_enabled;
     window._whatsNewSummaryEnabled=!!s.whats_new_summary_enabled;
     window._showThinking=s.show_thinking!==false;
+    window._hideInterimMessages=s.hide_interim_messages===true;  // local patch #26
     window._simplifiedToolCalling=true;
     window._chatActivityDisplayMode=s.chat_activity_display_mode==='transparent_stream'||s.chat_activity_display_mode==='hide_all_activity'
       ? s.chat_activity_display_mode

@@ -20639,7 +20639,13 @@ function renderMessages(options){
     if(m._activityBurstId!==undefined&&m._activityBurstId!==null) seg.setAttribute('data-activity-burst-id',String(m._activityBurstId));
     if(Number.isFinite(Number(m._liveSegmentSeq))) seg.setAttribute('data-live-segment-seq',String(Number(m._liveSegmentSeq)));
     const messageBelongsInWorklog=!S.busy&&isCompactWorklogMode()&&_assistantMessageBelongsInWorklog(m, rawIdx, toolCallAssistantIdxs, displayContent, {isTurnFinalAssistant});
-    if(messageBelongsInWorklog){
+    // Local patch #26: mid-turn narration is ordinary assistant content, so the
+    // worklog predicate above leaves it visible. When Allen opts in
+    // (hide_interim_messages), render ONLY the turn's final answer — every
+    // intermediate segment of a multi-step turn is dropped from the transcript.
+    // The text still lives in the worklog rows, one tap away.
+    const hideInterimSegment=window._hideInterimMessages===true&&!isUser&&!isTurnFinalAssistant;
+    if(messageBelongsInWorklog||hideInterimSegment){
       seg.classList.add('assistant-segment-worklog-source');
       seg.setAttribute('aria-hidden','true');
       seg.hidden=true;
