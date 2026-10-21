@@ -2704,6 +2704,105 @@ def _prune_orphaned_webui_zero_message_sessions(rows, *, diag_stage=None):
     ]
 
 
+_WEBUI_ORPHAN_ROW_GRACE_SECONDS = 600.0
+
+
+def _prune_orphaned_webui_sessions_without_agent_row(rows, *, diag_stage=None):
+    """Prune native-WebUI rows whose backend ``state.db.sessions`` row is gone.
+
+    Closes the cross-surface delete gap. A delete made on ANOTHER surface
+    (Hermes Desktop over ``hermes serve``, the CLI) removes the agent rows but
+    leaves the WebUI sidecar (+ turn/run journal + composer draft) behind, and
+    the sidebar re-lists that conversation on every poll because:
+
+    - ``_prune_orphaned_webui_zero_message_sessions`` gates on a row that still
+      EXISTS with an empty ``messages`` table — a deleted session has no row at
+      all, so it is invisible to that pass; and
+    - even when it is reached, a sidecar that still holds messages takes the
+      ``sidecar_has_messages`` retain branch.
+
+    Safety contract, mirroring the #4985 prune: any row carrying
+    ``active_stream_id`` / ``has_pending_user_message`` / ``pending_user_message``
+    / ``worktree_path`` / ``is_streaming`` is never pruned, and a row whose
+    sidecar was written inside ``_WEBUI_ORPHAN_ROW_GRACE_SECONDS`` is left alone
+    (a brand-new session can exist in the sidecar for a moment before the agent
+    commits its ``sessions`` row). The existence probe fails CLOSED — on any DB
+    error ``agent_session_rows_existing`` returns every id as present, so a
+    transient failure can never delete a live conversation.
+
+    Dead sids are pruned from the sidebar index, recorded in the deleted-session
+    tombstone (so recovery/audit/claim treat them as gone), and their artifacts
+    are ARCHIVED rather than unlinked.
+    """
+    if not rows:
+        return list(rows) if rows is not None else []
+    _diag = diag_stage if callable(diag_stage) else (lambda *_a, **_k: None)
+    now = time.time()
+    candidates: dict[object, list[str]] = defaultdict(list)
+    for row in rows:
+        sid = str(row.get("session_id") or "").strip()
+        if not sid:
+            continue
+        if (
+            row.get("active_stream_id")
+            or row.get("has_pending_user_message")
+            or row.get("pending_user_message")
+            or row.get("worktree_path")
+            or row.get("is_streaming")
+        ):
+            continue
+        try:
+            mtime = (SESSION_DIR / f"{sid}.json").stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        if mtime and (now - mtime) < _WEBUI_ORPHAN_ROW_GRACE_SECONDS:
+            continue
+        candidates[row.get("profile")].append(sid)
+    if not candidates:
+        return list(rows)
+    pruned: set[str] = set()
+    for profile_key, sid_list in candidates.items():
+        existing = agent_session_rows_existing(
+            sid_list,
+            profile=profile_key if isinstance(profile_key, str) and profile_key else None,
+        )
+        pruned.update(sid for sid in sid_list if sid not in existing)
+    if not pruned:
+        return list(rows)
+    for sid in pruned:
+        try:
+            prune_session_from_index(sid)
+        except Exception:
+            logger.debug(
+                "Failed to prune orphaned webui row %s from index", sid, exc_info=True
+            )
+        # Tombstone in its own step so a tombstone write failure can never
+        # block the archive — the row still leaves the sidebar either way.
+        try:
+            _record_webui_deleted_session_tombstone(sid)
+        except Exception:
+            logger.debug(
+                "Failed to tombstone archived webui orphan %s", sid, exc_info=True
+            )
+        try:
+            archived = archive_orphaned_webui_session_artifacts(sid)
+            if archived:
+                logger.info(
+                    "Archived %d orphaned webui artifact(s) for %s (no agent row)",
+                    len(archived),
+                    sid,
+                )
+        except Exception:
+            logger.debug(
+                "Failed to archive orphaned webui artifacts for %s", sid, exc_info=True
+            )
+    _diag("prune_orphaned_webui_session_without_agent_row")
+    return [
+        s for s in rows
+        if str(s.get("session_id") or "").strip() not in pruned
+    ]
+
+
 def _build_session_list_cache_payload(
     active_profile: str | None,
     all_profiles: bool,
@@ -2893,6 +2992,13 @@ def _build_session_list_cache_payload(
             _kept_after_orphan_prune,
             diag_stage=diag_stage,
         )
+        # Cross-surface delete gap: a session deleted from Hermes Desktop / CLI
+        # loses its state.db row but keeps its WebUI sidecar, so the sidebar
+        # re-lists it. Prune (and archive) rows whose agent row is gone.
+        webui_sessions = _prune_orphaned_webui_sessions_without_agent_row(
+            webui_sessions,
+            diag_stage=diag_stage,
+        )
         for s in webui_sessions:
             meta = cli_by_id.get(s.get("session_id"))
             if not meta:
@@ -2932,6 +3038,11 @@ def _build_session_list_cache_payload(
         # IC_kwDOR1LuPM8AAAABHsyFGg. Without this call the else branch
         # silently skipped the prune and the sidebar kept dangling rows.
         webui_sessions = _prune_orphaned_webui_zero_message_sessions(
+            webui_sessions,
+            diag_stage=diag_stage,
+        )
+        # Same cross-surface delete gap as the show_cli_sessions branch above.
+        webui_sessions = _prune_orphaned_webui_sessions_without_agent_row(
             webui_sessions,
             diag_stage=diag_stage,
         )
@@ -12238,6 +12349,7 @@ from api.models import (
     _is_empty_partial_activity_message,
     _hide_from_default_sidebar,
     prune_session_from_index,
+    archive_orphaned_webui_session_artifacts,
     agent_session_rows_existing,
     agent_session_zero_message_sids,
     _load_webui_zero_message_orphan_tombstone,

@@ -10,6 +10,7 @@ import logging
 import math
 import os
 import re
+import shutil
 import sqlite3
 import threading
 import time
@@ -786,6 +787,55 @@ def prune_session_from_index(session_id: str) -> None:
 
     if _fallback:
         _write_session_index(updates=None)
+
+
+_WEBUI_ORPHAN_ARCHIVE_SUBDIR = "webui-orphan-sessions"
+
+
+def archive_orphaned_webui_session_artifacts(session_id: str) -> list[str]:
+    """Move a dead WebUI session's on-disk artifacts into the orphan archive.
+
+    A delete performed on ANOTHER surface (Hermes Desktop, CLI, a sibling
+    profile's tooling) removes the agent rows but knows nothing about
+    ``SESSION_DIR``: the sidecar, its turn/run journals and the composer draft
+    stay behind, and ``recover_missing_index_sidecars`` re-lists the
+    conversation on the next poll — forever.
+
+    Moving (not unlinking) matches the archive-over-delete rule and still
+    empties the paths that resurrection reads.
+
+    Returns the archived paths (empty when nothing was there). Best-effort:
+    never raises, and one failure never blocks the remaining artifacts.
+    """
+    sid = str(session_id or "").strip()
+    if not sid or sid in {".", ".."} or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", sid):
+        return []
+    stamp = datetime.datetime.now().strftime("%Y%m%d")
+    dest_dir = SESSION_DIR.parent.parent / "archive" / _WEBUI_ORPHAN_ARCHIVE_SUBDIR / stamp
+    candidates: list[Path] = [
+        SESSION_DIR / f"{sid}.json",
+        SESSION_DIR / f"{sid}.jsonl",
+        SESSION_DIR / ".drafts" / f"{sid}.json",
+        SESSION_DIR / "_run_journal" / sid,
+    ]
+    try:
+        candidates.extend(sorted((SESSION_DIR / "_turn_journal").glob(f"{sid}~*.jsonl")))
+    except OSError:
+        pass
+    archived: list[str] = []
+    for src in candidates:
+        try:
+            if not src.exists():
+                continue
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            target = dest_dir / src.name
+            if target.exists():
+                target = dest_dir / f"{target.stem}.{int(time.time())}{target.suffix}"
+            shutil.move(str(src), str(target))
+            archived.append(str(target))
+        except Exception:
+            logger.debug("Failed to archive orphaned webui artifact %s", src, exc_info=True)
+    return archived
 
 
 # ---------------------------------------------------------------------------
