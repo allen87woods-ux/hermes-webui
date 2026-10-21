@@ -5165,10 +5165,11 @@ function _sessionSnapshotById(sid){
   return (_allSessions||[]).find(s=>s&&s.session_id===sid)||null;
 }
 function _pinnedSessionCount(){
-  // Local patch #21 (2026-10-11): count pins the way the Desktop does -- a pin
-  // survives archiving. Requiring "not archived" here hid every archived pin and
-  // silently undercounted against pinned_sessions_limit.
-  return (_allSessions||[]).filter(s=>s&&s.pinned).length;
+  // Local patch #27 (2026-10-21): mirrors the SERVER's pin quota
+  // (_session_counts_toward_pin_quota in api/routes.py), which excludes archived
+  // rows. Counting archived pins here made the client believe the quota was full
+  // while those pins were invisible -- blocking a pin the server would accept.
+  return (_allSessions||[]).filter(s=>s&&s.pinned&&!s.archived).length;
 }
 function _getPinnedSessionsLimit(){
   const limit=parseInt(window._pinnedSessionsLimit||3,10);
@@ -9492,14 +9493,14 @@ function _partitionSidebarSessionRows(allMatched, activeSidForSidebar){
       if(isCli) cliArchivedCount++;
       else webuiArchivedCount++;
     }
-    // Local patch #22 (2026-10-11): a PIN survives archiving. An archived row
-    // still joins the visible rows when it is pinned, so the star group can list
-    // it -- exactly what Hermes Desktop does (its listing asks for
-    // include_pinned=True). Dropping it here made a pin set on the Desktop (or on
-    // an archived conversation here) invisible on this surface, which read as
-    // "the two are not syncing" even though the stores agreed. Unpinned archived
-    // rows are still hidden unless "Show archived" is on.
-    if(!_showArchived&&s.archived&&!s.pinned) continue;
+    // Local patch #27 (2026-10-21, Allen): ARCHIVE means INVISIBLE, pins included.
+    // Patch #22's "a pin survives archiving" exception kept archived pins in the
+    // sidebar, so archiving a pinned conversation freed no screen space -- and
+    // every pin Allen had was archived. Archived rows now join the visible rows
+    // ONLY when "Show archived" is on; when it is, the pinned group below still
+    // collects them under the star heading (grouping keys on `pinned`, not on
+    // `archived`), so a pin is never lost among the unpinned archived history.
+    if(!_showArchived&&s.archived) continue;
     sessionsRaw.push(s);
   }
   if(_sessionSourceFilter==='cli' && !window._showCliSessions && cliSessionCount===0){
